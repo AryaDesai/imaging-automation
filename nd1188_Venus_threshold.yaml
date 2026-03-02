@@ -1,0 +1,44 @@
+parameters:
+  channel: Venus
+  channel_index: 0
+  sigma: 25
+  percentile: 90.0
+source:
+  file: /Users/aryadesai/Desktop/Ozbudak Lab/imaging automation/nd1188.nd2
+  image_shape:
+    T: 10
+    P: 4
+    Y: 1024
+    X: 1024
+diagnostics:
+  time_point: 0
+  saved_at: '2026-03-01T16:17:58'
+  embryos:
+  - id: 0
+    mask_area_px: 104858
+    mask_area_pct: 10.0
+    mean_intensity: 424.87
+    centroid:
+    - 660.11
+    - 423.43
+  - id: 1
+    mask_area_px: 104858
+    mask_area_pct: 10.0
+    mean_intensity: 461.77
+    centroid:
+    - 458.07
+    - 337.78
+  - id: 2
+    mask_area_px: 104858
+    mask_area_pct: 10.0
+    mean_intensity: 581.53
+    centroid:
+    - 426.31
+    - 328.64
+  - id: 3
+    mask_area_px: 96853
+    mask_area_pct: 9.24
+    mean_intensity: 610.51
+    centroid:
+    - 552.62
+    - 376.1
