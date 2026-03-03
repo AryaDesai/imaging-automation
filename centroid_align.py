@@ -13,6 +13,7 @@ import numpy as np
 import tifffile
 import yaml
 from scipy.ndimage import gaussian_filter, label, shift
+from tqdm import tqdm
 
 
 def load_nd2(file_path):
@@ -57,10 +58,7 @@ def align_frame(frame_all_channels, sigma, percentile, ch_idx):
     cy, cx = find_largest_component_centroid(smoothed, percentile)
     dy, dx = Y / 2 - cy, X / 2 - cx
 
-    shifted = np.zeros_like(frame_all_channels)
-    for c in range(frame_all_channels.shape[0]):
-        for z in range(frame_all_channels.shape[1]):
-            shifted[c, z] = shift(frame_all_channels[c, z], (dy, dx), order=1, mode="constant", cval=0)
+    shifted = shift(frame_all_channels, (0, 0, dy, dx), order=1, mode="constant", cval=0)
     return shifted
 
 
@@ -129,9 +127,11 @@ def main():
     # Also accumulate frames for MP4s: aligned[c][t] = list of P grayscale images
     aligned_for_mp4 = [[[] for _ in range(T)] for _ in range(C)]
 
+    print(f"\nAligning {P} embryo(s) × {T} timepoints ...")
     for p in range(P):
+        print(f"\n  Embryo {p}/{P-1}")
         volume = np.zeros((T, C, Z, Y, X), dtype=np.float32)
-        for t in range(T):
+        for t in tqdm(range(T), desc=f"    Aligning timepoints", unit="frame", leave=True):
             frame = data[t, p].transpose(1, 0, 2, 3)  # (Z,C,Y,X) -> (C,Z,Y,X)
             shifted = align_frame(frame, sigma, percentile, ch_idx)
             volume[t] = shifted
@@ -140,24 +140,27 @@ def main():
 
         fname = f"{base}_P{p}.ome.tif"
         fpath = os.path.join(out_dir, fname)
+        print(f"    Saving OME-TIFF: {fname} ...")
         tifffile.imwrite(fpath, volume, imagej=False, photometric="minisblack",
                          metadata={"axes": "TCZYX", "Channel": {"Name": channel_names}})
-        print(f"  Embryo {p}/{P-1} → {fname}")
+        print(f"    Saved {fname}")
 
     # 4. Save MP4s — one per channel, 2×2 grid over time
+    print(f"\nWriting MP4s for {C} channel(s) ...")
     for c in range(C):
         ch_name = channel_names[c]
         mp4_path = os.path.join(out_dir, f"{base}_{ch_name}_aligned.mp4")
-        print(f"  Writing {mp4_path} ...")
+        print(f"  Channel '{ch_name}': {mp4_path}")
 
         writer = imageio.get_writer(mp4_path, fps=args.fps)
-        for t in range(T):
+        for t in tqdm(range(T), desc=f"    Encoding frames", unit="frame", leave=True):
             grid = make_grid_frame(aligned_for_mp4[c][t])
             rgb = np.stack([grid, grid, grid], axis=-1)
             writer.append_data(rgb)
         writer.close()
+        print(f"  Saved {os.path.basename(mp4_path)}")
 
-    print("Done.")
+    print("\nDone.")
 
 
 if __name__ == "__main__":
