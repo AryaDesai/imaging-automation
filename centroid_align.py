@@ -60,7 +60,7 @@ def align_frame(frame_all_channels, sigma, percentile, ch_idx):
     dy, dx = Y / 2 - cy, X / 2 - cx
 
     shifted = shift(frame_all_channels, (0, 0, dy, dx), order=1, mode="constant", cval=0)
-    return shifted
+    return shifted, dy, dx
 
 
 def compute_shift(frame_all_channels, sigma, percentile, ch_idx):
@@ -215,7 +215,8 @@ def main():
             volume = np.zeros((T, C, Z, Y, X), dtype=np.float32)
             for t in tqdm(range(T), desc=f"    Aligning timepoints", unit="frame", leave=True):
                 frame = data[t, p].transpose(1, 0, 2, 3)  # (Z,C,Y,X) -> (C,Z,Y,X)
-                shifted = align_frame(frame, sigma, percentile, ch_idx)
+                shifted, dy, dx = align_frame(frame, sigma, percentile, ch_idx)
+                tqdm.write(f"    T={t:3d}:  dy={dy:+7.2f}  dx={dx:+7.2f}")
                 volume[t] = shifted
                 for c in range(C):
                     aligned_for_mp4[c][t].append(auto_contrast(shifted[c].max(axis=0)))
