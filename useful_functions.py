@@ -83,6 +83,53 @@ def load_nd2(file_path):
     return data.astype(np.float32), channel_names, vox, period_s
 
 
+def load_nd2_metadata(file_path):
+    """Load channel names, voxel size, and acquisition period from an ND2 file
+    without reading any image data into memory.
+
+    load_nd2 calls f.asarray() which loads the entire image volume — up to
+    several gigabytes for a typical timelapse. Scripts that only need metadata
+    (channel names, physical voxel size, time interval) should call this
+    function instead to avoid that cost. The z-alignment script, for example,
+    reads image data from already-written OME-TIFFs and only needs the ND2
+    for the physical calibration values that were stored there at acquisition
+    time.
+
+    The return signature is a subset of load_nd2 (minus the data array) so
+    that callers can switch between the two functions without restructuring
+    their unpacking.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the .nd2 file.
+
+    Returns
+    -------
+    channel_names : list of str
+    vox           : VoxelSize  (.x, .y, .z in µm)
+    period_s      : float or None
+    """
+    f = nd2.ND2File(file_path)
+
+    channel_names = [ch.channel.name for ch in f.metadata.channels]
+
+    vox = f.voxel_size()
+
+    # Same TimeLoop extraction as load_nd2 — see that function for rationale.
+    period_s = next(
+        (loop.parameters.periodMs / 1000.0
+         for loop in f.experiment if loop.type == "TimeLoop"),
+        None,
+    )
+
+    # Close immediately — we never called asarray() so no image data was
+    # loaded, but the file handle must still be released.
+    f.close()
+
+    return channel_names, vox, period_s
+
+
 def max_project_z(data):
     """Collapse the Z axis of a (T, P, Z, C, Y, X) array by taking the maximum.
 
@@ -312,6 +359,245 @@ def align_frame_xy(frame, sigma, percentile, ch_idx):
     shifted = shift(frame, (0, 0, dy, dx), order=1, mode="constant", cval=0)
 
     return shifted, dy, dx
+
+
+# ── Z centroid detection ──────────────────────────────────────────────────────
+#
+# These functions detect and correct drift along the optical (Z) axis.
+# The approach mirrors the XY centroid pipeline: compute a scalar position
+# estimate from the signal, compare it to a reference, and shift the data
+# to compensate.
+#
+# Unlike XY drift, which is corrected by a continuous sub-pixel shift, Z
+# correction uses an integer slice shift because the Z axis is discretely
+# sampled (one confocal plane per slice) and sub-slice interpolation along Z
+# would resample across planes that were physically acquired independently.
+# The integer shift is rounded from a float centroid, so the detection
+# precision is still sub-slice even though the applied correction is not.
+#
+# The float centroid is also converted to physical units (µm) and returned
+# so that callers driving automated stage control can command the objective
+# to move by the exact physical amount rather than a rounded slice count.
+#
+# Detection channel: the diagnostic in z_diagnostic.py established that the
+# Venus channel (clock gene) gives the most reliable Z centroid across all
+# four embryo positions. mCherry (nuclear marker) signal is concentrated at
+# the top of the Z range and shows no useful Z-dependent variation. TD
+# (transmission) metrics are noisier than Venus. Venus mean intensity per
+# Z-slice is therefore the detection signal used throughout this section.
+
+def compute_z_profile(frame, ch_idx):
+    """Return the mean intensity per Z-slice for the chosen channel.
+
+    Averaging over all pixels in each (Y, X) plane produces a 1-D profile
+    of signal strength versus Z position. This profile is the input to
+    compute_centroid_z and captures how the fluorescent signal is distributed
+    along the optical axis.
+
+    We use mean rather than sum so that the profile values are independent
+    of image size and can be compared across experiments with different
+    field-of-view dimensions.
+
+    Parameters
+    ----------
+    frame : ndarray, shape (C, Z, Y, X), float32
+        A single timepoint for a single embryo position.
+    ch_idx : int
+        Index of the channel to use for Z detection. The z_diagnostic.py
+        analysis identified Venus (index 0) as the most reliable choice.
+
+    Returns
+    -------
+    profile : ndarray, shape (Z,), float64
+        Mean pixel intensity at each Z-slice.
+    """
+    # Select the detection channel and average over the spatial axes (Y, X).
+    # axis=(1, 2) collapses Y and X simultaneously, leaving one value per
+    # Z-slice. We compute over the full (Y, X) frame rather than a subregion
+    # because the Venus signal fills the embryo body and using the full frame
+    # gives a more stable average than any manually chosen subregion.
+    return frame[ch_idx].mean(axis=(1, 2))
+
+
+def compute_centroid_z(profile):
+    """Return the intensity-weighted mean Z position (centroid) of a Z profile.
+
+    The centroid is the continuous analogue of argmax: instead of returning
+    the single slice with the highest intensity, it returns the weighted
+    average Z position, which is more stable when the peak is broad or when
+    two adjacent slices have similar intensities.
+
+    Before computing the weighted average, the minimum value of the profile
+    is subtracted from every element. This removes any uniform background
+    floor — signal that is present at the same level across all Z-slices and
+    therefore carries no information about the embryo's Z position. Without
+    this subtraction, a high background would pull the centroid toward Z/2
+    regardless of where the actual signal peak is.
+
+    If the background-subtracted profile is all zeros (blank frame or
+    signal entirely below background level), the centroid falls back to
+    the midpoint of the Z range. This keeps the downstream shift at zero
+    rather than producing a NaN or an extreme value that would corrupt the
+    alignment.
+
+    Parameters
+    ----------
+    profile : ndarray, shape (Z,)
+        Mean intensity per Z-slice, as returned by compute_z_profile.
+
+    Returns
+    -------
+    centroid : float
+        Intensity-weighted mean Z position in slice units. Can be fractional.
+    """
+    # Subtract the minimum to remove background before computing the centroid.
+    # The minimum is the baseline signal present even in out-of-signal slices;
+    # only the excess above this baseline reflects actual Z-localised signal.
+    above_background = profile - profile.min()
+
+    total = above_background.sum()
+
+    if total == 0:
+        # All slices are equally bright (or all zero) — the profile carries
+        # no Z position information. Returning the midpoint means the computed
+        # shift will be zero, leaving the frame unchanged rather than crashing.
+        return len(profile) / 2.0
+
+    # np.arange gives the slice index for each element of the profile.
+    # The weighted sum (index * weight) / total_weight is the standard
+    # formula for centre of mass, applied here along the Z axis.
+    z_indices = np.arange(len(profile), dtype=float)
+    return float((above_background * z_indices).sum() / total)
+
+
+def compute_shift_z(frame, ch_idx, reference_centroid, vox_z):
+    """Return the integer Z shift and its physical equivalent in micrometres.
+
+    Computes the current Z centroid of the embryo, compares it to the
+    reference centroid established at t=0, and returns the correction needed
+    to restore alignment.
+
+    Two values are returned because they serve different purposes:
+      dz_slices — the integer shift applied to the image data in post-
+                  processing. Rounded from the float centroid difference so
+                  that the correction is always a whole number of slices.
+      dz_um     — the exact physical correction in micrometres, derived from
+                  the un-rounded float centroid difference multiplied by the
+                  Z voxel size. Used by automated acquisition pipelines to
+                  command the microscope stage by the precise physical amount
+                  rather than the nearest slice boundary.
+
+    The sign convention matches scipy.ndimage.shift: a positive dz_slices
+    moves image content toward higher Z indices (upward in the stack), and
+    a negative dz_slices moves it toward lower Z indices.
+
+    Parameters
+    ----------
+    frame : ndarray, shape (C, Z, Y, X), float32
+        Current timepoint for one embryo position.
+    ch_idx : int
+        Channel index for Z detection (Venus = 0).
+    reference_centroid : float
+        Z centroid at t=0, in slice units. Stored by the calling script
+        on the first timepoint and passed in on all subsequent timepoints.
+    vox_z : float
+        Physical Z voxel size in µm/slice, from load_nd2 vox.z. Used to
+        convert the slice-unit centroid difference to micrometres.
+
+    Returns
+    -------
+    dz_slices : int
+        Integer number of slices to shift. Positive = toward higher Z.
+    dz_um : float
+        Physical correction in µm (un-rounded, for stage control).
+    """
+    profile          = compute_z_profile(frame, ch_idx)
+    current_centroid = compute_centroid_z(profile)
+
+    # The raw float difference gives the exact drift in slice units.
+    # Rounding to the nearest integer gives the shift we can apply to
+    # the discrete Z stack without interpolation.
+    dz_float  = reference_centroid - current_centroid
+    dz_slices = int(round(dz_float))
+
+    # Multiply the un-rounded float by vox_z so the physical correction
+    # preserves sub-slice precision for stage control. Using dz_float
+    # rather than dz_slices here avoids accumulating rounding error when
+    # this value is fed to a stage controller over many timepoints.
+    dz_um = dz_float * vox_z
+
+    # tqdm.write is used instead of print so this line does not visually
+    # corrupt any active tqdm progress bar in the calling script.
+    tqdm.write(f"dz={dz_slices:+d} slices  ({dz_um:+.2f} µm)")
+
+    return dz_slices, dz_um
+
+
+def align_frame_z(frame, dz_slices):
+    """Shift a (C, Z, Y, X) frame along the Z axis by an integer number of slices.
+
+    Moves all channels together by the same dz_slices so that every channel
+    remains in Z-registration with the others after correction — the same
+    reason all channels are shifted together in align_frame_xy.
+
+    The shift is implemented with array slicing rather than scipy.ndimage.shift
+    because Z correction is always an integer number of slices. scipy shift
+    would apply interpolation along Z even with an integer shift value, which
+    would mix signal from adjacent confocal planes that were physically
+    acquired independently. Array slicing moves whole planes without any
+    resampling.
+
+    Slices that shift outside the original Z range are replaced with zeros.
+    This is the programmatic equivalent of the blank frames inserted manually
+    when scrolling through Z to track drifting cells.
+
+    Parameters
+    ----------
+    frame : ndarray, shape (C, Z, Y, X), float32
+        Single timepoint for one embryo position.
+    dz_slices : int
+        Number of slices to shift. Positive = move content toward higher Z
+        indices (slices at the low end become zero). Negative = move content
+        toward lower Z indices (slices at the high end become zero).
+
+    Returns
+    -------
+    shifted : ndarray, shape (C, Z, Y, X), float32
+        Z-shifted copy of the input frame. Input is not modified.
+    """
+    if dz_slices == 0:
+        # No shift needed — return a copy for consistency with the non-zero
+        # case so callers can always treat the return value as a new array.
+        return frame.copy()
+
+    Z = frame.shape[1]
+
+    # Pre-fill with zeros so that any slice position not written by the
+    # copy below is automatically zero-padded rather than uninitialised.
+    shifted = np.zeros_like(frame)
+
+    # Clamp the shift magnitude to Z so that an over-large shift (more slices
+    # than the stack has) produces an all-zero output rather than an index
+    # error. In normal use dz_slices << Z because the user monitors the
+    # acquisition, but this guard prevents a crash if a corrupt centroid
+    # estimate produces an extreme value.
+    dz = min(abs(dz_slices), Z)
+
+    if dz_slices > 0:
+        # Positive shift: content moves toward higher Z indices.
+        # frame[:, 0:Z-dz, :, :] (the portion that stays in frame)
+        # is placed at shifted[:, dz:Z, :, :].
+        # The first dz slices of shifted remain zero (the newly exposed
+        # low end of the stack).
+        shifted[:, dz:, :, :] = frame[:, :Z - dz, :, :]
+    else:
+        # Negative shift: content moves toward lower Z indices.
+        # frame[:, dz:Z, :, :] is placed at shifted[:, 0:Z-dz, :, :].
+        # The last dz slices of shifted remain zero (the newly exposed
+        # high end of the stack).
+        shifted[:, :Z - dz, :, :] = frame[:, dz:, :, :]
+
+    return shifted
 
 
 # ── Format conversion ─────────────────────────────────────────────────────────
