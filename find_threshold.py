@@ -1,5 +1,4 @@
 import datetime
-import nd2
 import numpy as np
 import os
 import streamlit as st
@@ -7,35 +6,43 @@ import time
 import subprocess
 import yaml
 from PIL import Image, ImageDraw
-from scipy.ndimage import gaussian_filter, label
+from scipy.ndimage import gaussian_filter
+
+from useful_functions import find_largest_mask_xy, load_nd2, max_project_z
 
 
 @st.cache_resource
-def load_nd2(file_path):
-    """Load ND2 file and return Z-max-projected array (T,P,C,Y,X) + channel names."""
-    f = nd2.ND2File(file_path)
-    data = f.asarray()  # (T, P, Z, C, Y, X)
-    channel_names = [ch.channel.name for ch in f.metadata.channels]
-    f.close()
-    return data.max(axis=2).astype(np.float32), channel_names
+def load_nd2_projected(file_path):
+    """Load an ND2 file and return a Z-max-projected array (T,P,C,Y,X) + channel names.
+
+    This is a Streamlit-specific cached wrapper around embryo_tools.load_nd2.
+    The @st.cache_resource decorator means the file is loaded only once per
+    Streamlit session; subsequent widget interactions (slider moves, parameter
+    changes) reuse the cached array rather than re-reading from disk.
+
+    We project to (T, P, C, Y, X) here because find_threshold.py never needs
+    the full Z stack — it works on 2-D images for display and thresholding.
+    Discarding Z early reduces the memory held by the Streamlit cache.
+    """
+    data, channel_names, _, _ = load_nd2(file_path)
+    return max_project_z(data), channel_names
 
 
 @st.cache_data()
 def get_smoothed(t, p, ch_idx, sigma, _file_path):
-    """Gaussian-filter a single frame. Cached for precompute."""
-    max_proj, _ = load_nd2(_file_path)
+    """Gaussian-filter a single frame and cache the result.
+
+    The @st.cache_data decorator caches the output keyed on (t, p, ch_idx,
+    sigma, file_path). This means the Gaussian filter is only computed once
+    per unique combination of parameters; re-running the Streamlit script
+    after a slider move reuses cached results for previously seen combinations.
+
+    The _file_path argument is prefixed with _ to tell Streamlit's cache not
+    to hash it (hashing a long path string on every rerun is wasteful; the
+    path is effectively constant within a session).
+    """
+    max_proj, _ = load_nd2_projected(_file_path)
     return gaussian_filter(max_proj[t, p, ch_idx], sigma=sigma)
-
-
-def find_largest_mask(smoothed, percentile):
-    """Threshold at percentile, return largest component mask and its centroid."""
-    binary = smoothed > np.percentile(smoothed, percentile)
-    labeled, _ = label(binary)
-    sizes = np.bincount(labeled.ravel())
-    sizes[0] = 0
-    mask = labeled == sizes.argmax()
-    centroid = np.argwhere(mask).mean(axis=0)  # (y, x)
-    return mask, centroid
 
 
 def render_embryo(img, mask, centroid):
@@ -91,7 +98,7 @@ if not file_path:
     st.info("Click **Browse for ND2 file** in the sidebar to get started.")
     st.stop()
 
-max_proj, channel_names = load_nd2(file_path)
+max_proj, channel_names = load_nd2_projected(file_path)
 T, P, C, Y, X = max_proj.shape
 
 with st.sidebar:
@@ -131,7 +138,7 @@ with st.sidebar:
         for pi in range(P):
             img = max_proj[0, pi, ch_idx]
             smoothed = get_smoothed(0, pi, ch_idx, sigma, file_path)
-            mask, centroid = find_largest_mask(smoothed, percentile)
+            mask, centroid = find_largest_mask_xy(smoothed, percentile)
             area = int(mask.sum())
             embryos_data.append({
                 "id": pi,
@@ -181,7 +188,7 @@ def render_grid():
             with cols[col_idx]:
                 img = max_proj[t, p, ch_idx]
                 smoothed = get_smoothed(t, p, ch_idx, sigma, file_path)
-                mask, centroid = find_largest_mask(smoothed, percentile)
+                mask, centroid = find_largest_mask_xy(smoothed, percentile)
 
                 st.image(render_embryo(img, mask, centroid), caption=f"Embryo {p}")
 
