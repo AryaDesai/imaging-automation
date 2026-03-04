@@ -1,9 +1,14 @@
-"""centroid_align_z.py — correct Z-axis drift in XY-aligned OME-TIFF stacks.
+"""centroid_align_z.py -- correct Z-axis drift in XY-aligned OME-TIFF stacks.
 
 Reads the per-embryo OME-TIFFs produced by centroid_align_xy.py, detects
 Z-axis drift at each timepoint using the intensity centroid of a chosen
 fluorescent channel along Z, applies an integer slice shift to compensate,
 and writes Z-corrected OME-TIFFs to the same directory.
+
+The user selects a reference timepoint (--ref_t) where the PSM looks how
+they want it to for analysis. The Z centroid at that timepoint becomes the
+target; all other timepoints are shifted so their centroids match, keeping
+every Z slice at the same anatomical depth across T.
 
 The detection channel defaults to index 0 (Venus). The z_diagnostic.py
 analysis established that the Venus intensity centroid is the most reliable
@@ -20,6 +25,7 @@ physical amount rather than a rounded slice count.
 
 Usage:
     python centroid_align_z.py nd1188_Venus_threshold.yaml
+    python centroid_align_z.py nd1188_Venus_threshold.yaml --ref_t 5
     python centroid_align_z.py nd1188_Venus_threshold.yaml --ch_idx 1
 """
 
@@ -60,6 +66,15 @@ def main():
              "z_diagnostic.py established Venus as the most reliable Z indicator "
              "for this dataset.",
     )
+    parser.add_argument(
+        "--ref_t",
+        type=int,
+        default=0,
+        help="Reference timepoint for Z alignment. Choose a frame where the "
+             "PSM looks how you want it to for analysis. All other timepoints "
+             "are shifted to match this frame's Z centroid so the anatomy stays "
+             "at the same Z slice across T. (default: 0)",
+    )
     args = parser.parse_args()
 
     # ── 1. Load YAML config ───────────────────────────────────────────────────
@@ -84,6 +99,7 @@ def main():
     print(f"  Channels: {channel_names}")
     print(f"  Voxel z:  {vox.z:.3f} µm/slice")
     print(f"  Z detection channel: {channel_names[args.ch_idx]} (index {args.ch_idx})")
+    print(f"  Reference timepoint: t={args.ref_t}")
 
     # ── 3. Find XY-aligned TIFFs ──────────────────────────────────────────────
 
@@ -126,13 +142,18 @@ def main():
         T, C, Z, Y, X = volume.shape
         print(f"    Shape: T={T}, C={C}, Z={Z}, Y={Y}, X={X}")
 
-        # Compute the reference Z centroid from t=0. Every subsequent timepoint
-        # is shifted to match this value so the same anatomical Z position
-        # stays at the same slice index throughout the timelapse — the goal
-        # that motivates the whole Z-alignment step.
-        profile_0          = compute_z_profile(volume[0], args.ch_idx)
-        reference_centroid = compute_centroid_z(profile_0)
-        print(f"    Reference Z centroid (t=0): {reference_centroid:.3f} slices"
+        # Compute the reference Z centroid from the user-chosen timepoint.
+        # Every other timepoint is shifted to match this value so that
+        # whatever anatomy is visible at a given Z slice in the reference
+        # frame stays at that same slice index across the entire timelapse.
+        ref_t = args.ref_t
+        if ref_t < 0 or ref_t >= T:
+            print(f"    Error: --ref_t {ref_t} is out of range [0, {T-1}]",
+                  file=sys.stderr)
+            sys.exit(1)
+        profile_ref        = compute_z_profile(volume[ref_t], args.ch_idx)
+        reference_centroid = compute_centroid_z(profile_ref)
+        print(f"    Reference Z centroid (t={ref_t}): {reference_centroid:.3f} slices"
               f"  ({reference_centroid * vox.z:.2f} µm)")
 
         corrected = np.zeros_like(volume)
