@@ -1,26 +1,33 @@
-"""centroid_align_xy.py — align embryo movies by XY centroid tracking.
+"""centroid_align_xy.py -- align embryo movies by XY centroid tracking.
 
 Reads a threshold YAML produced by find_threshold.py, loads the full ND2
 file, shifts each embryo to the frame centre at every timepoint, and writes
 one OME-TIFF per embryo position and one MP4 per channel.
 
-"XY" in the script name is intentional: only lateral (XY) drift is corrected.
-Z-axis (focus) drift correction is a separate problem not handled here.
+With --from_z_tiffs, the script reads the Z-corrected TIFFs produced by
+centroid_align_z.py instead of the raw ND2 file. This lets you run Z
+alignment first (to stabilise the focal plane) and then XY alignment on
+the result. The same YAML file is used; the script locates the *_z.ome.tif
+files in the aligned directory automatically.
 
-All image processing functions are defined in embryo_tools.py. This script
-contains only argument parsing, file I/O orchestration, and progress reporting.
+All image processing functions are defined in useful_functions.py. This
+script contains only argument parsing, file I/O orchestration, and progress
+reporting.
 
 Usage:
     python centroid_align_xy.py nd1188_Venus_threshold.yaml
     python centroid_align_xy.py nd1188_Venus_threshold.yaml --enlarge_canvas
+    python centroid_align_xy.py nd1188_Venus_threshold.yaml --from_z_tiffs
 """
 
 import argparse
+import glob
 import os
 import sys
 
 import imageio
 import numpy as np
+import tifffile
 import yaml
 from scipy.ndimage import shift
 from tqdm import tqdm
@@ -30,6 +37,7 @@ from useful_functions import (
     auto_contrast,
     compute_shift_xy,
     load_nd2,
+    load_nd2_metadata,
     make_grid_frame,
     save_ome_tiff,
 )
@@ -47,6 +55,13 @@ def main():
             "asymmetrically before aligning so no edge data is lost."
         ),
     )
+    parser.add_argument(
+        "--from_z_tiffs",
+        action="store_true",
+        help="Run XY alignment on the Z-corrected TIFFs produced by "
+             "centroid_align_z.py instead of loading raw data from the ND2 "
+             "file. Uses the same YAML to locate the aligned directory.",
+    )
     args = parser.parse_args()
 
     # ── 1. Load YAML config ───────────────────────────────────────────────────
@@ -63,10 +78,33 @@ def main():
         print(f"Error: ND2 file not found: {nd2_path}", file=sys.stderr)
         sys.exit(1)
 
-    # ── 2. Load ND2 ───────────────────────────────────────────────────────────
+    base    = os.path.splitext(os.path.basename(nd2_path))[0]
+    out_dir = os.path.join(os.path.dirname(nd2_path) or ".", f"aligned_{base}")
 
-    print(f"Loading {nd2_path} ...")
-    data, channel_names, vox, period_s = load_nd2(nd2_path)
+    # ── 2. Load image data ────────────────────────────────────────────────────
+
+    if args.from_z_tiffs:
+        # Load only metadata from the ND2; image data comes from the
+        # Z-corrected TIFFs produced by centroid_align_z.py.
+        print(f"Loading metadata from {nd2_path} ...")
+        channel_names, vox, period_s = load_nd2_metadata(nd2_path)
+
+        tiff_paths = sorted(glob.glob(os.path.join(out_dir, f"{base}_P*_z.ome.tif")))
+        if not tiff_paths:
+            print(f"Error: no Z-aligned TIFFs found in {out_dir}", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"  Loading {len(tiff_paths)} Z-aligned TIFF(s) from {out_dir}/ ...")
+        tiff_list = [tifffile.imread(p).astype(np.float32) for p in tiff_paths]
+        # Each TIFF is (T, C, Z, Y, X). Stack along a new P axis and
+        # rearrange to (T, P, Z, C, Y, X) to match the ND2 axis convention
+        # that the alignment code below expects.
+        data = np.stack(tiff_list, axis=1).transpose(0, 1, 3, 2, 4, 5)
+        del tiff_list
+    else:
+        print(f"Loading {nd2_path} ...")
+        data, channel_names, vox, period_s = load_nd2(nd2_path)
+
     T, P, Z, C, Y, X = data.shape
     print(f"  Shape: T={T}, P={P}, Z={Z}, C={C}, Y={Y}, X={X}")
     print(f"  Channels: {channel_names}")
@@ -75,10 +113,11 @@ def main():
 
     # ── 3. Prepare output directory ───────────────────────────────────────────
 
-    base    = os.path.splitext(os.path.basename(nd2_path))[0]
-    out_dir = os.path.join(os.path.dirname(nd2_path) or ".", f"aligned_{base}")
     os.makedirs(out_dir, exist_ok=True)
     print(f"  Output: {out_dir}/")
+
+    # Output suffix distinguishes Z-then-XY-aligned files from XY-only files.
+    suffix = "_z_xy" if args.from_z_tiffs else ""
 
     # Collect max-projected, contrast-normalised frames for MP4 encoding.
     # Structure: aligned_for_mp4[channel_index][timepoint] = list of (Y,X) uint8 images,
@@ -149,7 +188,7 @@ def main():
                 for c in range(C):
                     aligned_for_mp4[c][t].append(auto_contrast(shifted[c].max(axis=0)))
 
-            fpath = os.path.join(out_dir, f"{base}_P{p}.ome.tif")
+            fpath = os.path.join(out_dir, f"{base}_P{p}{suffix}.ome.tif")
             print(f"    Saving {os.path.basename(fpath)} ...")
             save_ome_tiff(fpath, volume, channel_names, vox, period_s)
             print(f"    Saved {os.path.basename(fpath)}")
@@ -170,7 +209,7 @@ def main():
                 for c in range(C):
                     aligned_for_mp4[c][t].append(auto_contrast(shifted[c].max(axis=0)))
 
-            fpath = os.path.join(out_dir, f"{base}_P{p}.ome.tif")
+            fpath = os.path.join(out_dir, f"{base}_P{p}{suffix}.ome.tif")
             print(f"    Saving {os.path.basename(fpath)} ...")
             save_ome_tiff(fpath, volume, channel_names, vox, period_s)
             print(f"    Saved {os.path.basename(fpath)}")
@@ -183,7 +222,7 @@ def main():
     print(f"\nWriting MP4s for {C} channel(s) ...")
     for c in range(C):
         ch_name  = channel_names[c]
-        mp4_path = os.path.join(out_dir, f"{base}_{ch_name}_aligned.mp4")
+        mp4_path = os.path.join(out_dir, f"{base}_{ch_name}{suffix}_aligned.mp4")
         print(f"  Channel '{ch_name}': {mp4_path}")
 
         writer = imageio.get_writer(mp4_path, fps=args.fps)
