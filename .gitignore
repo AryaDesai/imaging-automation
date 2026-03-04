@@ -1,3 +1,4 @@
 *.nd2
 __pycache__/
 *.pyc
+CLAUDE.md
