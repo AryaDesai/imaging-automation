@@ -1,3 +1,5 @@
 *.nd2
 __pycache__/
 *.pyc
+*.md
+.DS_Store
