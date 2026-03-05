@@ -38,7 +38,7 @@ def load_nd2(file_path):
 
     Parameters
     ----------
-    file_path : str
+    file_path : str or Path
         Absolute or relative path to the .nd2 file.
 
     Returns
@@ -101,7 +101,7 @@ def load_nd2_metadata(file_path):
 
     Parameters
     ----------
-    file_path : str
+    file_path : str or Path
         Path to the .nd2 file.
 
     Returns
@@ -617,7 +617,7 @@ def save_ome_tiff(filepath, volume, channel_names, vox, period_s):
 
     Parameters
     ----------
-    filepath : str
+    filepath : str or Path
         Full destination path including filename, e.g.
         "/data/aligned_nd1188/nd1188_P0.ome.tif".
     volume : ndarray, shape (T, C, Z, Y, X), dtype float32

@@ -1,9 +1,11 @@
 import datetime
-import numpy as np
-import os
-import streamlit as st
-import time
+import platform
 import subprocess
+import time
+from pathlib import Path
+
+import numpy as np
+import streamlit as st
 import yaml
 from PIL import Image, ImageDraw
 from scipy.ndimage import gaussian_filter
@@ -63,8 +65,16 @@ def render_embryo(img, mask, centroid):
     return composite
 
 
+# TODO: if other scripts are added that also need a file picker,
+# extract pick_nd2_file into a shared ui_helpers.py rather than useful_functions.py.
 def pick_nd2_file():
-    """Open a native macOS file dialog filtered to .nd2 files."""
+    """Open a native macOS file dialog filtered to .nd2 files.
+
+    Uses osascript (AppleScript) which is only available on macOS. This
+    function should only be called when platform.system() == "Darwin".
+    On other platforms the text input field is the sole entry point for
+    the file path.
+    """
     script = '''
     set f to POSIX path of (choose file of type {"nd2"} with prompt "Select ND2 file")
     return f
@@ -85,17 +95,22 @@ if "playing" not in st.session_state:
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    if st.button("Browse for ND2 file"):
-        path = pick_nd2_file()
-        if path:
-            st.session_state["nd2_path"] = path
+    # osascript is macOS-only; on other platforms (Windows, Linux, servers)
+    # the text input below is the sole entry point for the file path.
+    if platform.system() == "Darwin":
+        if st.button("Browse for ND2 file"):
+            picked = pick_nd2_file()
+            if picked:
+                st.session_state["nd2_path"] = picked
 
-    file_path = st.session_state.get("nd2_path", "")
-    if file_path:
-        st.text(os.path.basename(file_path))
+    file_path = st.text_input(
+        "ND2 file path",
+        value=st.session_state.get("nd2_path", ""),
+    )
+    st.session_state["nd2_path"] = file_path
 
 if not file_path:
-    st.info("Click **Browse for ND2 file** in the sidebar to get started.")
+    st.info("Enter the path to an ND2 file in the sidebar to get started.")
     st.stop()
 
 max_proj, channel_names = load_nd2_projected(file_path)
@@ -156,7 +171,9 @@ with st.sidebar:
                 "percentile": percentile,
             },
             "source": {
-                "file": file_path,
+                # Normalise through Path so the stored string uses the
+                # OS-native separator on whichever platform the YAML is written.
+                "file": str(Path(file_path)),
                 "image_shape": {"T": T, "P": P, "Y": Y, "X": X},
             },
             "diagnostics": {
@@ -166,7 +183,7 @@ with st.sidebar:
             },
         }
 
-        base = os.path.splitext(os.path.basename(file_path))[0]
+        base = Path(file_path).stem
         fname = f"{base}_{channel}_threshold.yaml"
         with open(fname, "w") as fout:
             yaml.dump(output, fout, default_flow_style=False, sort_keys=False)

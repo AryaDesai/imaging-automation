@@ -4,8 +4,8 @@ Usage: python movie_from_nd2.py nd1188.nd2
 """
 
 import argparse
-import os
 import sys
+from pathlib import Path
 
 import imageio
 import numpy as np
@@ -19,8 +19,8 @@ def main():
     parser.add_argument("--fps", type=float, default=2, help="Frames per second (default: 2)")
     args = parser.parse_args()
 
-    nd2_path = args.nd2_file
-    if not os.path.isfile(nd2_path):
+    nd2_path = Path(args.nd2_file)
+    if not nd2_path.is_file():
         print(f"Error: file not found: {nd2_path}", file=sys.stderr)
         sys.exit(1)
 
@@ -35,13 +35,13 @@ def main():
     print(f"  Shape: T={T}, P={P}, C={C}, Y={Y}, X={X}")
     print(f"  Channels: {channel_names}")
 
-    base    = os.path.splitext(os.path.basename(nd2_path))[0]
-    out_dir = os.path.join(os.path.dirname(nd2_path) or ".", f"raw_{base}")
-    os.makedirs(out_dir, exist_ok=True)
+    base    = nd2_path.stem
+    out_dir = nd2_path.parent / f"raw_{base}"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     for c in range(C):
         ch_name  = channel_names[c]
-        mp4_path = os.path.join(out_dir, f"{base}_{ch_name}_raw.mp4")
+        mp4_path = out_dir / f"{base}_{ch_name}_raw.mp4"
         print(f"  Writing {mp4_path} ...")
 
         writer = imageio.get_writer(mp4_path, fps=args.fps)

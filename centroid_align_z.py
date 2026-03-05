@@ -41,9 +41,8 @@ Usage:
 """
 
 import argparse
-import glob
-import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import tifffile
@@ -103,9 +102,9 @@ def main():
     with open(args.yaml_file) as f:
         cfg = yaml.safe_load(f)
 
-    nd2_path = cfg["source"]["file"]
+    nd2_path = Path(cfg["source"]["file"])
 
-    if not os.path.isfile(nd2_path):
+    if not nd2_path.is_file():
         print(f"Error: ND2 file not found: {nd2_path}", file=sys.stderr)
         sys.exit(1)
 
@@ -124,10 +123,10 @@ def main():
 
     # ── 3. Find XY-aligned TIFFs ──────────────────────────────────────────────
 
-    base        = os.path.splitext(os.path.basename(nd2_path))[0]
-    aligned_dir = os.path.join(os.path.dirname(nd2_path) or ".", f"aligned_{base}")
+    base        = nd2_path.stem
+    aligned_dir = nd2_path.parent / f"aligned_{base}"
 
-    if not os.path.isdir(aligned_dir):
+    if not aligned_dir.is_dir():
         print(f"Error: aligned directory not found: {aligned_dir}", file=sys.stderr)
         print("Run centroid_align_xy.py first to produce XY-aligned TIFFs.",
               file=sys.stderr)
@@ -137,8 +136,8 @@ def main():
     # by centroid_align_xy.py. Files ending in _z.ome.tif are excluded so that
     # re-running this script on the same directory does not process its own
     # previous output.
-    tiff_paths = sorted(glob.glob(os.path.join(aligned_dir, f"{base}_P*.ome.tif")))
-    tiff_paths = [p for p in tiff_paths if not p.endswith("_z.ome.tif")]
+    tiff_paths = sorted(aligned_dir.glob(f"{base}_P*.ome.tif"))
+    tiff_paths = [p for p in tiff_paths if not p.name.endswith("_z.ome.tif")]
 
     if not tiff_paths:
         print(f"Error: no XY-aligned TIFFs found in {aligned_dir}", file=sys.stderr)
@@ -151,7 +150,7 @@ def main():
 
     print(f"\nAligning {P} embryo(s) ...")
     for tiff_path in tiff_paths:
-        p_label = os.path.basename(tiff_path)
+        p_label = tiff_path.name
         print(f"\n  {p_label}")
 
         # tifffile.imread reads the OME-TIFF and respects the TCZYX axis order
@@ -244,10 +243,13 @@ def main():
 
         # Insert _z before .ome.tif to produce the output filename, making it
         # clear this file has had both XY and Z correction applied.
-        out_path = tiff_path.replace(".ome.tif", "_z.ome.tif")
-        print(f"    Saving {os.path.basename(out_path)} ...")
+        # with_name operates only on the filename component, never touching
+        # directory separators — unlike a bare str.replace on the full path,
+        # which would corrupt the path if ".ome.tif" appeared in a directory name.
+        out_path = tiff_path.with_name(tiff_path.name.replace(".ome.tif", "_z.ome.tif"))
+        print(f"    Saving {out_path.name} ...")
         save_ome_tiff(out_path, corrected, channel_names, vox, period_s)
-        print(f"    Saved {os.path.basename(out_path)}")
+        print(f"    Saved {out_path.name}")
 
     print("\nDone.")
 

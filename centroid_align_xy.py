@@ -21,9 +21,8 @@ Usage:
 """
 
 import argparse
-import glob
-import os
 import sys
+from pathlib import Path
 
 import imageio
 import numpy as np
@@ -72,14 +71,14 @@ def main():
     sigma      = cfg["parameters"]["sigma"]
     percentile = cfg["parameters"]["percentile"]
     ch_idx     = cfg["parameters"]["channel_index"]
-    nd2_path   = cfg["source"]["file"]
+    nd2_path = Path(cfg["source"]["file"])
 
-    if not os.path.isfile(nd2_path):
+    if not nd2_path.is_file():
         print(f"Error: ND2 file not found: {nd2_path}", file=sys.stderr)
         sys.exit(1)
 
-    base    = os.path.splitext(os.path.basename(nd2_path))[0]
-    out_dir = os.path.join(os.path.dirname(nd2_path) or ".", f"aligned_{base}")
+    base    = nd2_path.stem
+    out_dir = nd2_path.parent / f"aligned_{base}"
 
     # ── 2. Load image data ────────────────────────────────────────────────────
 
@@ -89,7 +88,7 @@ def main():
         print(f"Loading metadata from {nd2_path} ...")
         channel_names, vox, period_s = load_nd2_metadata(nd2_path)
 
-        tiff_paths = sorted(glob.glob(os.path.join(out_dir, f"{base}_P*_z.ome.tif")))
+        tiff_paths = sorted(out_dir.glob(f"{base}_P*_z.ome.tif"))
         if not tiff_paths:
             print(f"Error: no Z-aligned TIFFs found in {out_dir}", file=sys.stderr)
             sys.exit(1)
@@ -113,8 +112,8 @@ def main():
 
     # ── 3. Prepare output directory ───────────────────────────────────────────
 
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"  Output: {out_dir}/")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  Output: {out_dir}")
 
     # Output suffix distinguishes Z-then-XY-aligned files from XY-only files.
     suffix = "_z_xy" if args.from_z_tiffs else ""
@@ -188,10 +187,10 @@ def main():
                 for c in range(C):
                     aligned_for_mp4[c][t].append(auto_contrast(shifted[c].max(axis=0)))
 
-            fpath = os.path.join(out_dir, f"{base}_P{p}{suffix}.ome.tif")
-            print(f"    Saving {os.path.basename(fpath)} ...")
+            fpath = out_dir / f"{base}_P{p}{suffix}.ome.tif"
+            print(f"    Saving {fpath.name} ...")
             save_ome_tiff(fpath, volume, channel_names, vox, period_s)
-            print(f"    Saved {os.path.basename(fpath)}")
+            print(f"    Saved {fpath.name}")
 
     # ── 4b. Single-pass path (default) ───────────────────────────────────────
 
@@ -209,10 +208,10 @@ def main():
                 for c in range(C):
                     aligned_for_mp4[c][t].append(auto_contrast(shifted[c].max(axis=0)))
 
-            fpath = os.path.join(out_dir, f"{base}_P{p}{suffix}.ome.tif")
-            print(f"    Saving {os.path.basename(fpath)} ...")
+            fpath = out_dir / f"{base}_P{p}{suffix}.ome.tif"
+            print(f"    Saving {fpath.name} ...")
             save_ome_tiff(fpath, volume, channel_names, vox, period_s)
-            print(f"    Saved {os.path.basename(fpath)}")
+            print(f"    Saved {fpath.name}")
 
     # ── 5. Write MP4s ─────────────────────────────────────────────────────────
 
@@ -222,7 +221,7 @@ def main():
     print(f"\nWriting MP4s for {C} channel(s) ...")
     for c in range(C):
         ch_name  = channel_names[c]
-        mp4_path = os.path.join(out_dir, f"{base}_{ch_name}{suffix}_aligned.mp4")
+        mp4_path = out_dir / f"{base}_{ch_name}{suffix}_aligned.mp4"
         print(f"  Channel '{ch_name}': {mp4_path}")
 
         writer = imageio.get_writer(mp4_path, fps=args.fps)
@@ -233,7 +232,7 @@ def main():
             rgb = np.stack([grid, grid, grid], axis=-1)
             writer.append_data(rgb)
         writer.close()
-        print(f"  Saved {os.path.basename(mp4_path)}")
+        print(f"  Saved {mp4_path.name}")
 
     print("\nDone.")
 

@@ -1,10 +1,11 @@
 import nd2
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 from matplotlib.widgets import Slider
 
 # ── change this to your actual file path ──────────────────────────────────────
-FILE_PATH = "nd1188.nd2"
+FILE_PATH = Path("nd1188.nd2")
 # ─────────────────────────────────────────────────────────────────────────────
 
 f = nd2.ND2File(FILE_PATH)
