@@ -11,6 +11,8 @@ library grows substantially, splitting into sub-modules is straightforward
 once the API has stabilised.
 """
 
+from pathlib import Path
+
 import nd2
 import numpy as np
 import tifffile
@@ -80,7 +82,7 @@ def load_nd2(file_path):
     # Leaving it open would hold a file lock for the duration of the script.
     f.close()
 
-    return data.astype(np.float32), channel_names, vox, period_s
+    return data, channel_names, vox, period_s
 
 
 def load_nd2_metadata(file_path):
@@ -655,6 +657,173 @@ def save_ome_tiff(filepath, volume, channel_names, vox, period_s):
             "Channel": {"Name": channel_names},
         },
     )
+
+
+
+def concatenate_tifs(tif_paths, output_path, axis=0):
+    """Concatenate multiple OME-TIFFs along a chosen axis.
+
+    Joins a set of OME-TIFF files by concatenating along the specified
+    axis (default 0, which is T in TCZYX volumes). Input files are sorted
+    by filename before concatenation — ND2 files are named sequentially
+    by the microscope (nd1188, nd1189, ...), so alphabetical order
+    corresponds to acquisition time order.
+
+    All dimensions except the concatenation axis must match across files.
+    A mismatch is raised as an error.
+
+    OME metadata is compared across files. Inconsistencies are printed as
+    warnings but do not prevent concatenation. The OME-XML from the first
+    file is passed through to the output.
+
+    Data is streamed to the output one input file at a time using
+    tifffile's append mode, so only one input file's data is in memory
+    at any point.
+
+    Parameters
+    ----------
+    tif_paths : list of str or Path
+        Paths to OME-TIFF files.
+    output_path : str or Path
+        Destination path for the concatenated OME-TIFF.
+    axis : int, default 0
+        Axis along which to concatenate. 0=T, 1=C, 2=Z, 3=Y, 4=X for
+        TCZYX volumes.
+    """
+    # Sort by filename so that files from sequentially named ND2s
+    # (nd1188, nd1189, ...) are concatenated in acquisition order.
+    # Alphabetical sorting works because the microscope assigns ascending
+    # numeric suffixes within each session.
+    sorted_paths = sorted(tif_paths, key=lambda p: Path(p).name)
+
+    # Collect array shapes and OME-XML metadata from each file before
+    # loading any pixel data. This pass is used to verify that all files
+    # have compatible dimensions and consistent metadata before committing
+    # to the concatenation.
+    shapes = []
+    ome_xmls = []
+    for path in sorted_paths:
+        # TiffFile opens the file and parses the TIFF header and any
+        # OME-XML in the ImageDescription tag. series[0].shape gives the
+        # full array shape without reading pixel data into memory.
+        # ome_metadata returns the OME-XML as a string if present, or
+        # None for plain TIFFs that have no OME block.
+        f = tifffile.TiffFile(path)
+        shapes.append(f.series[0].shape)
+        ome_xmls.append(f.ome_metadata)
+        f.close()
+
+    # Verify that all dimensions except the concatenation axis match.
+    # For example, when concatenating along axis 0 (T) with shape
+    # (T, C, Z, Y, X), the C, Z, Y, X values must be identical across
+    # all files. Files with different spatial dimensions or channel counts
+    # cannot be concatenated into a single coherent volume.
+    ref_shape = shapes[0]
+    for i, shape in enumerate(shapes[1:], start=1):
+        for dim in range(len(ref_shape)):
+            if dim == axis:
+                continue
+            if shape[dim] != ref_shape[dim]:
+                raise ValueError(
+                    f"Dimension mismatch on axis {dim}: "
+                    f"{Path(sorted_paths[0]).name} has {ref_shape[dim]} "
+                    f"but {Path(sorted_paths[i]).name} has {shape[dim]}."
+                )
+
+    # Compare OME metadata across files. The OME-XML string encodes
+    # voxel sizes, channel names, and time calibration. Files from the
+    # same imaging session should have identical metadata, but slight
+    # differences (e.g. floating-point rounding in voxel size between
+    # acquisition runs) can occur without affecting the image data.
+    # These are printed as warnings rather than raised as errors so the
+    # user is aware but concatenation still proceeds.
+    ref_ome = ome_xmls[0]
+    if ref_ome is not None:
+        for i, ome in enumerate(ome_xmls[1:], start=1):
+            if ome is None:
+                tqdm.write(
+                    f"Warning: {Path(sorted_paths[i]).name} has no OME metadata"
+                )
+            elif ome != ref_ome:
+                tqdm.write(
+                    f"Warning: OME metadata in {Path(sorted_paths[i]).name} "
+                    f"differs from {Path(sorted_paths[0]).name}"
+                )
+
+    total_along_axis = sum(s[axis] for s in shapes)
+    tqdm.write(f"Concatenating {len(sorted_paths)} files -> {total_along_axis} total along axis {axis}")
+
+    # Parse the first file's OME-XML to extract physical calibration
+    # (voxel sizes, time interval, channel names). These values are
+    # passed to TiffWriter as a metadata dict so that tifffile generates
+    # a fresh OME-XML header whose dimension counts (SizeT, SizeC, SizeZ)
+    # match the actual number of pages in the concatenated output.
+    # Passing the raw XML string directly would preserve the original
+    # SizeT from a single ND2 file, causing Fiji to misread the axes.
+    import xml.etree.ElementTree as ET
+
+    ome_metadata = {"axes": "TCZYX"}
+    if ref_ome is not None:
+        root = ET.fromstring(ref_ome)
+        # OME-XML wraps every tag in its namespace, e.g.
+        # {http://www.openmicroscopy.org/Schemas/OME/2016-06}Pixels.
+        # Extracting the namespace from the root tag lets us find
+        # child elements without assuming a specific schema version.
+        ns = root.tag.split("}")[0] + "}" if "}" in root.tag else ""
+        pixels = root.find(f".//{ns}Pixels")
+        if pixels is not None:
+            for attr in ["PhysicalSizeX", "PhysicalSizeY", "PhysicalSizeZ", "TimeIncrement"]:
+                val = pixels.get(attr)
+                if val is not None:
+                    ome_metadata[attr] = float(val)
+            for attr in ["PhysicalSizeXUnit", "PhysicalSizeYUnit", "PhysicalSizeZUnit", "TimeIncrementUnit"]:
+                val = pixels.get(attr)
+                if val is not None:
+                    ome_metadata[attr] = val
+
+        # Channel names (Venus, mCherry, TD, etc.) so Fiji labels them
+        # correctly in the channel manager instead of showing "C=0".
+        channels = root.findall(f".//{ns}Channel")
+        if channels:
+            names = [ch.get("Name") for ch in channels if ch.get("Name")]
+            if names:
+                ome_metadata["Channel"] = {"Name": names}
+
+    # Build the full output shape by summing along the concatenation
+    # axis. The remaining dimensions (C, Z, Y, X) come from the first
+    # file since they were already verified to match across all inputs.
+    out_shape = list(ref_shape)
+    out_shape[axis] = total_along_axis
+    out_shape = tuple(out_shape)
+
+    def page_generator():
+        """Yield 2D (Y, X) pages from each input file in order.
+
+        Each file's 5D array (T, C, Z, Y, X) is flattened to (T*C*Z, Y, X)
+        so that every confocal plane becomes one TIFF page. Reading and
+        flattening one file at a time keeps peak memory at the size of a
+        single input file rather than the full concatenated volume.
+        """
+        for path in tqdm(sorted_paths, desc="Concatenating", unit="file"):
+            data = tifffile.imread(path).astype(np.float32)
+            yield from data.reshape(-1, data.shape[-2], data.shape[-1])
+            del data
+
+    # imwrite with a generator and an explicit shape lets tifffile
+    # stream pages to disk while knowing the full 5D dimensions
+    # upfront. It generates a single OME Image element with the
+    # correct SizeT, SizeC, SizeZ, voxel sizes, and channel names.
+    tifffile.imwrite(
+        output_path,
+        page_generator(),
+        shape=out_shape,
+        dtype=np.float32,
+        bigtiff=True,
+        photometric="minisblack",
+        metadata=ome_metadata,
+    )
+
+    tqdm.write(f"Done. Output: {output_path}")
 
 
 # ── Display utilities ─────────────────────────────────────────────────────────
