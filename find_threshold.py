@@ -99,8 +99,10 @@ def load_file(file_path):
 
     Returns
     -------
-    max_proj : ndarray, shape (T, P, C, Y, X), float32
-        Z-max-projected image data.
+    max_proj : ndarray or LazyTifAccessor, shape (T, P, C, Y, X)
+        Z-max-projected image data. For ND2 files this is a float32 ndarray
+        loaded into memory. For TIF files this is a LazyTifAccessor that
+        loads one timepoint at a time to avoid out-of-memory errors.
     channel_names : list of str
         Channel names. For ND2 files these come from the microscope metadata;
         for TIF files they default to "Ch0", "Ch1", etc. because TIF metadata
@@ -117,23 +119,10 @@ def load_file(file_path):
         max_proj = max_project_z(data)
         return max_proj, channel_names, True
 
-    # TIF / OME-TIFF path.
-    # tifffile.imread returns the raw array. The expected axis order for
-    # single-embryo stacks from this pipeline is (T, C, Z, Y, X).
-    raw = tifffile.imread(file_path).astype(np.float32)
+    # TIF / OME-TIFF path: use lazy accessor to avoid loading entire file.
+    accessor = LazyTifAccessor(file_path)
 
-    # Max-project Z (axis 2) to collapse to (T, C, Y, X).
-    projected = raw.max(axis=2)
-
-    # Insert a P axis at position 1 so the shape becomes (T, 1, C, Y, X),
-    # matching the ND2 convention. This lets all downstream code treat
-    # single-embryo TIFs identically to multi-embryo ND2 files.
-    max_proj = np.expand_dims(projected, axis=1)
-
-    C = max_proj.shape[2]
-    channel_names = [f"Ch{i}" for i in range(C)]
-
-    return max_proj, channel_names, False
+    return accessor, accessor.channel_names, False
 
 
 # ── Rendering ─────────────────────────────────────────────────────────────────
