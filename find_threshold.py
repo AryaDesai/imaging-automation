@@ -375,6 +375,10 @@ class ThresholdApp:
         self.status_var.set("Loading...")
         self.root.update_idletasks()
 
+        # Close the previous TIF accessor if one exists (releases file handle).
+        if hasattr(self.max_proj, 'close'):
+            self.max_proj.close()
+
         self.file_path = path
         self.max_proj, self.channel_names, self.is_nd2 = load_file(path)
         self.T, self.P, self.C, self.Y, self.X = self.max_proj.shape
