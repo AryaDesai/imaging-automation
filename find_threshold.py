@@ -32,14 +32,60 @@ import yaml
 from PIL import Image, ImageDraw, ImageTk
 from scipy.ndimage import gaussian_filter
 
-from useful_functions import find_largest_mask_xy, load_nd2, max_project_z
+from useful_functions import find_largest_mask_xy, load_nd2, load_tif_metadata, max_project_z
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 
+class LazyTifAccessor:
+    """Lazy accessor for TIF files that loads one timepoint at a time.
+
+    Provides array-like indexing `[t, p, c]` to retrieve a 2-D (Y, X) image,
+    but only loads and max-projects the requested timepoint from disk. This
+    prevents out-of-memory errors when working with large concatenated TIFs.
+
+    The accessor mimics the shape (T, P, C, Y, X) that the app expects, with
+    P always equal to 1 for single-embryo TIFs.
+    """
+
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.tif = tifffile.TiffFile(file_path)
+        self.series = self.tif.series[0]
+        # Expected shape from save_ome_tiff: (T, C, Z, Y, X)
+        self.T, self.C, self.Z, self.Y, self.X = self.series.shape
+        self.P = 1  # Single embryo per TIF
+        self.shape = (self.T, self.P, self.C, self.Y, self.X)
+        # Load channel names from OME metadata (e.g. "Venus", "mCherry").
+        self.channel_names, _, _ = load_tif_metadata(file_path)
+        # Cache the most recently loaded timepoint to avoid redundant reads
+        # when the user switches channels without changing T.
+        self._cache_t = None
+        self._cache_data = None  # Shape: (C, Y, X) — max-projected
+
+    def __getitem__(self, idx):
+        """Return a 2-D (Y, X) image for the given (t, p, c) index."""
+        t, p, c = idx
+        if t != self._cache_t:
+            # Load all C*Z pages for this timepoint and max-project Z.
+            pages_per_t = self.C * self.Z
+            start = t * pages_per_t
+            frame_czyx = np.stack(
+                [self.series.pages[start + i].asarray() for i in range(pages_per_t)]
+            ).reshape(self.C, self.Z, self.Y, self.X).astype(np.float32)
+            # Max-project Z → (C, Y, X)
+            self._cache_data = frame_czyx.max(axis=1)
+            self._cache_t = t
+        return self._cache_data[c]
+
+    def close(self):
+        """Close the underlying TIF file handle."""
+        self.tif.close()
+
+
 def load_file(file_path):
-    """Load an ND2 or TIF file and return a Z-max-projected array + metadata.
+    """Load an ND2 or TIF file and return a Z-max-projected accessor + metadata.
 
     Both file types are normalised to the same output shape (T, P, C, Y, X)
     so that the rest of the application does not need to distinguish between
