@@ -1,9 +1,9 @@
-"""embryo_tools.py — shared library for the Ozbudak Lab ND2 imaging pipeline.
+"""
 
 All functions needed by more than one script live here so that the logic is
 defined and maintained in one place. The individual run-scripts
 (centroid_align_xy.py, movie_from_nd2.py, find_threshold.py) are thin entry
-points that handle argument parsing and I/O orchestration only.
+points that handle argument parsing and I/O only.
 
 A single flat file is used rather than a sub-package because the toolkit is
 small enough that one file is easier to audit, share, and extend. If the
@@ -11,9 +11,13 @@ library grows substantially, splitting into sub-modules is straightforward
 once the API has stabilised.
 """
 
+from pathlib import Path
+import subprocess
 import nd2
 import numpy as np
 import tifffile
+import torch
+import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter, label, shift
 from tqdm import tqdm
 
@@ -23,27 +27,26 @@ from tqdm import tqdm
 def load_nd2(file_path):
     """Load a Nikon ND2 file and return the full raw array plus acquisition metadata.
 
-    Returns the array as (T, P, Z, C, Y, X) float32. We deliberately keep all
-    six axes rather than collapsing Z here because different consumers have
-    different needs: centroid_align_xy.py works on the full 3-D volume per
-    timepoint, while find_threshold.py and movie_from_nd2.py only need a
-    max-projection. Callers that need a 2-D representation should pass the
-    result to max_project_z() below.
+    Returns the array as (T, P, Z, C, Y, X) in the file's native dtype (usually uint16).
+    We deliberately keep all six axes rather than collapsing Z here because
+    different consumers have different needs: centroid_align_xy.py works on
+    the full 3-D volume per timepoint, while find_threshold.py and
+    movie_from_nd2.py only need a max-projection. Callers that need a 2-D
+    representation should pass the result to max_project_z() below.
 
-    We cast to float32 immediately so that all arithmetic in downstream
-    functions operates on a consistent numeric type. The raw ND2 values are
-    typically uint16, but float32 avoids integer overflow when we do blurring
-    or intensity scaling, and is still compact enough for large files (half the
-    memory of float64).
+    We return the native dtype to save memory and avoid premature casting.
+    Callers should cast to float32 if they need to perform floating-point
+    arithmetic (e.g. for Gaussian smoothing). The raw ND2 values are typically
+    uint16.
 
     Parameters
     ----------
-    file_path : str
+    file_path : str or Path
         Absolute or relative path to the .nd2 file.
 
     Returns
     -------
-    data : ndarray, shape (T, P, Z, C, Y, X), dtype float32
+    data : ndarray, shape (T, P, Z, C, Y, X), dtype (native, usually uint16)
     channel_names : list of str
         Human-readable names from the microscope metadata (e.g. "Venus",
         "Brightfield"). Preserved so output filenames and OME-TIFF metadata
@@ -80,7 +83,7 @@ def load_nd2(file_path):
     # Leaving it open would hold a file lock for the duration of the script.
     f.close()
 
-    return data.astype(np.float32), channel_names, vox, period_s
+    return data, channel_names, vox, period_s
 
 
 def load_nd2_metadata(file_path):
@@ -101,7 +104,7 @@ def load_nd2_metadata(file_path):
 
     Parameters
     ----------
-    file_path : str
+    file_path : str or Path
         Path to the .nd2 file.
 
     Returns
@@ -126,6 +129,77 @@ def load_nd2_metadata(file_path):
     # Close immediately — we never called asarray() so no image data was
     # loaded, but the file handle must still be released.
     f.close()
+
+    return channel_names, vox, period_s
+
+
+def load_tif_metadata(file_path):
+    """Load channel names, voxel size, and acquisition period from an
+    OME-TIFF written by save_ome_tiff, without reading any image data.
+
+    Reads the JSON stored in the ImageDescription tag by save_ome_tiff.
+    Returns the same (channel_names, vox, period_s) signature as
+    load_nd2_metadata so callers can switch between the two without
+    restructuring their unpacking.
+
+    Parameters
+    ----------
+    file_path : str or Path
+
+    Returns
+    -------
+    channel_names : list of str
+    vox           : SimpleNamespace  (.x, .y, .z in µm)
+    period_s      : float or None
+    """
+    import json
+    import xml.etree.ElementTree as ET
+    from types import SimpleNamespace
+
+    with tifffile.TiffFile(file_path) as tif:
+        C = tif.series[0].shape[1]  # TCZYX — C is axis 1
+        try:
+            # save_ome_tiff stores the metadata dict as JSON in the ImageDescription
+            # tag of the first page. tif.pages[0].description decodes that tag as a string.
+            meta = json.loads(tif.pages[0].description)
+            channel_names = meta["Channel"]["Name"]
+            # SimpleNamespace provides the .x, .y, .z attribute interface that save_ome_tiff expects.
+            vox = SimpleNamespace(
+                x=meta["PhysicalSizeX"],
+                y=meta["PhysicalSizeY"],
+                z=meta["PhysicalSizeZ"],
+            )
+            period_s = meta.get("TimeIncrement")
+        except Exception as e:
+            print(f"  Could not read save_ome_tiff JSON metadata ({e}), trying OME-XML ...")
+            try:
+                # tif.ome_metadata returns the raw OME-XML string embedded by external
+                # software (e.g. Fiji, Imaris). Parse it with the stdlib XML parser.
+                root = ET.fromstring(tif.ome_metadata)
+                # OME-XML tags are namespace-qualified, e.g.
+                # {http://www.openmicroscopy.org/Schemas/OME/2016-06}Pixels.
+                # Extract the namespace URI from the root tag so XPath queries work
+                # regardless of which OME schema version the file uses.
+                ns = root.tag.split('}')[0].lstrip('{') if '}' in root.tag else ''
+                # Find the Pixels element anywhere in the tree using a namespace-aware path.
+                p = root.find(f'.//{{{ns}}}Pixels')
+                channel_names = [
+                    ch.get('Name', f'ch{i}')
+                    for i, ch in enumerate(p.findall(f'{{{ns}}}Channel'))
+                ]
+                # SimpleNamespace provides the .x, .y, .z attribute interface that save_ome_tiff expects.
+                vox = SimpleNamespace(
+                    x=float(p.get('PhysicalSizeX')),
+                    y=float(p.get('PhysicalSizeY')),
+                    z=float(p.get('PhysicalSizeZ')),
+                )
+                # TimeIncrement is optional in OME-XML; absent means no timelapse.
+                period_s = float(p.get('TimeIncrement')) if p.get('TimeIncrement') else None
+            except Exception as e2:
+                print(f"  Could not read OME-XML metadata ({e2}), using dummy values.")
+                channel_names = [f"ch{i}" for i in range(C)]
+                vox = SimpleNamespace(x=1.0, y=1.0, z=1.0)
+                period_s = None
 
     return channel_names, vox, period_s
 
@@ -318,6 +392,42 @@ def compute_shift_xy(frame, sigma, percentile, ch_idx):
     return dy, dx
 
 
+def compute_shift_xy_gpu(frame, sigma, percentile, ch_idx):
+    """GPU-accelerated version of compute_shift_xy.
+
+    Gaussian blur runs on GPU; connected-component labeling stays on CPU.
+    Parameters are identical to compute_shift_xy.
+    """
+    Y, X = frame.shape[2], frame.shape[3]
+
+    # Move the entire frame to GPU once at the start.
+    t_frame = torch.from_numpy(frame).to("mps")  # (C, Z, Y, X)
+
+    # Extract the detection channel and max-project over Z to get a 2-D image.
+    projection = t_frame[ch_idx].max(dim=0).values  # (Y, X)
+
+    # Gaussian blur suppresses noise and isolated bright spots that could
+    # pull the centroid away from the embryo body. conv2d expects (N, C_in, H, W).
+    kernel = _gaussian_kernel_2d(sigma, device="mps")
+    padding = kernel.shape[-1] // 2
+    proj_4d = projection.reshape(1, 1, Y, X)
+    smoothed_gpu = F.conv2d(proj_4d, kernel, padding=padding)
+
+    # Squeeze to (Y, X) and pull to CPU for connected-component labeling.
+    smoothed = smoothed_gpu.squeeze().cpu().numpy()
+
+    _, centroid = find_largest_mask_xy(smoothed, percentile)
+    cy, cx = centroid[0], centroid[1]
+
+    # dy > 0 when the embryo is above centre → shift image downward.
+    # dy < 0 when the embryo is below centre → shift image upward.
+    dy = Y / 2 - cy
+    dx = X / 2 - cx
+    tqdm.write(f"dy={dy:+7.2f}  dx={dx:+7.2f}")
+
+    return dy, dx
+
+
 def align_frame_xy(frame, sigma, percentile, ch_idx):
     """Compute the centring shift and apply it to all channels and Z-slices.
 
@@ -359,6 +469,107 @@ def align_frame_xy(frame, sigma, percentile, ch_idx):
     shifted = shift(frame, (0, 0, dy, dx), order=1, mode="constant", cval=0)
 
     return shifted, dy, dx
+
+
+def _gaussian_kernel_2d(sigma, device="mps"):
+    """Build a normalised 2D Gaussian kernel as a torch tensor.
+
+    Kernel radius is 4*sigma (rounded up), matching scipy's default truncate=4.
+    """
+    radius = int(np.ceil(sigma * 4))
+    size = 2 * radius + 1
+    coords = torch.arange(size, dtype=torch.float32, device=device) - radius
+    g1d = torch.exp(-coords ** 2 / (2 * sigma ** 2))
+    kernel = g1d[:, None] * g1d[None, :]
+    kernel /= kernel.sum()
+    # conv2d expects (out_channels, in_channels, height, width).
+    # Single input and output channel since we blur one grayscale image.
+    return kernel.reshape(1, 1, size, size)
+
+
+def align_frame_xy_gpu(frame, sigma, percentile, ch_idx):
+    """GPU-accelerated version of align_frame_xy.
+
+    Gaussian blur and integer-pixel shift run on GPU. Connected-component
+    labeling (find_largest_mask_xy) stays on CPU because scipy.ndimage.label
+    has no torch equivalent.
+
+    Returns the shifted frame as a torch tensor on the GPU device.
+    dy and dx are the raw centroid offsets before rounding.
+
+    Parameters are identical to align_frame_xy.
+    """
+    C, Z, Y, X = frame.shape
+
+    # Move entire frame to GPU once; it stays there until the final result.
+    t_frame = torch.from_numpy(frame).to("mps")  # (C, Z, Y, X)
+
+    # Max-project the detection channel over Z to get a 2D image.
+    projection = t_frame[ch_idx].max(dim=0).values  # (Y, X)
+
+    # Gaussian blur on GPU. conv2d expects (N, C_in, H, W).
+    kernel = _gaussian_kernel_2d(sigma, device="mps")
+    padding = kernel.shape[-1] // 2  # same-size output
+    proj_4d = projection.reshape(1, 1, Y, X)
+    smoothed_gpu = F.conv2d(proj_4d, kernel, padding=padding)
+
+    # Pull the small blurred 2D image to CPU for connected-component labeling.
+    smoothed = smoothed_gpu.squeeze().cpu().numpy()  # (Y, X)
+
+    _, centroid = find_largest_mask_xy(smoothed, percentile)
+    cy, cx = centroid[0], centroid[1]
+
+    dy = Y / 2 - cy
+    dx = X / 2 - cx
+    tqdm.write(f"dy={dy:+7.2f}  dx={dx:+7.2f}")
+
+    # Round to integer pixels — sub-pixel interpolation is not needed here.
+    idy = int(round(dy))
+    idx = int(round(dx))
+
+    # Pad zeros on the side content shifts away from, then slice back to
+    # original size. Exposed edges become zero, no wrapping occurs.
+    padded = F.pad(t_frame, (max(idx, 0), max(-idx, 0), max(idy, 0), max(-idy, 0)))
+    shifted_gpu = padded[:, :, max(-idy, 0):max(-idy, 0)+Y, max(-idx, 0):max(-idx, 0)+X]
+
+    return shifted_gpu, dy, dx
+
+
+def apply_shift_xy_gpu(frame, dy, dx):
+    """Apply a precomputed (dy, dx) shift to a frame on GPU.
+
+    Used in the --enlarge_canvas two-pass workflow, where shifts are
+    precomputed in Pass 1 and applied in Pass 2.
+
+    The shift is rounded to integer pixels, consistent with align_frame_xy_gpu.
+
+    Parameters
+    ----------
+    frame : ndarray, shape (C, Z, Y, X)
+        A single timepoint for a single embryo.
+    dy : float
+        Shift in Y (positive = move content downward).
+    dx : float
+        Shift in X (positive = move content rightward).
+
+    Returns
+    -------
+    shifted_gpu : torch.Tensor, shape (C, Z, Y, X), on GPU
+        Caller is responsible for moving to CPU when done.
+    """
+    C, Z, Y, X = frame.shape
+
+    t_frame = torch.from_numpy(frame).to("mps")  # (C, Z, Y, X)
+
+    idy = int(round(dy))
+    idx = int(round(dx))
+
+    # Pad zeros on the side content shifts away from, then slice back to
+    # original size. Mirrors the same operation in align_frame_xy_gpu.
+    padded = F.pad(t_frame, (max(idx, 0), max(-idx, 0), max(idy, 0), max(-idy, 0)))
+    shifted_gpu = padded[:, :, max(-idy, 0):max(-idy, 0)+Y, max(-idx, 0):max(-idx, 0)+X]
+
+    return shifted_gpu
 
 
 # ── Z centroid detection ──────────────────────────────────────────────────────
@@ -602,8 +813,9 @@ def align_frame_z(frame, dz_slices):
 
 # ── Format conversion ─────────────────────────────────────────────────────────
 
-def save_ome_tiff(filepath, volume, channel_names, vox, period_s):
-    """Write a (T, C, Z, Y, X) float32 volume as an OME-TIFF with full physical metadata.
+def save_ome_tiff(filepath, volume, channel_names, vox, period_s,
+                  shape=None, dtype=None):
+    """Write a (T, C, Z, Y, X) volume as an OME-TIFF with full physical metadata.
 
     OME-TIFF is chosen as the output format because it embeds physical pixel
     size, channel names, and acquisition timing in a standardised XML block
@@ -617,11 +829,12 @@ def save_ome_tiff(filepath, volume, channel_names, vox, period_s):
 
     Parameters
     ----------
-    filepath : str
+    filepath : str or Path
         Full destination path including filename, e.g.
         "/data/aligned_nd1188/nd1188_P0.ome.tif".
-    volume : ndarray, shape (T, C, Z, Y, X), dtype float32
-        The aligned image stack for one embryo position.
+    volume : ndarray or generator
+        When an ndarray, shape (T, C, Z, Y, X). When a generator, must yield
+        one (C, Z, Y, X) frame per timepoint, and shape/dtype must be provided.
     channel_names : list of str
         Channel names in the same order as the C axis (e.g. ["Venus", "BF"]).
         Written into the OME metadata so channels are labelled correctly in
@@ -632,29 +845,205 @@ def save_ome_tiff(filepath, volume, channel_names, vox, period_s):
         than in arbitrary pixel units.
     period_s : float or None
         Time between frames in seconds from load_nd2. Written as TimeIncrement
-        so the time axis is correctly calibrated. None is safe to pass — Fiji
+        so the time axis is correctly calibrated. None is safe to pass -- Fiji
         will simply leave the time axis uncalibrated.
+    shape : tuple, optional
+        Required when volume is a generator. The full (T, C, Z, Y, X) shape
+        so tifffile can write the OME-XML header before consuming frames.
+    dtype : numpy dtype, optional
+        Required when volume is a generator. The pixel dtype (e.g. np.uint16).
     """
-    # photometric="minisblack" tells readers that low values = black (dark),
-    # high values = bright signal. This is the correct convention for
-    # fluorescence microscopy; the alternative "miniswhite" would invert the LUT.
+    metadata = {
+        "axes": "TCZYX",
+        "PhysicalSizeX": vox.x, "PhysicalSizeXUnit": "µm",
+        "PhysicalSizeY": vox.y, "PhysicalSizeYUnit": "µm",
+        "PhysicalSizeZ": vox.z, "PhysicalSizeZUnit": "µm",
+        "TimeIncrement": period_s, "TimeIncrementUnit": "s",
+        "Channel": {"Name": channel_names},
+    }
+    # When volume is a generator, shape and dtype must be declared upfront so
+    # tifffile can write the OME-XML header before consuming any frames.
+    # bigtiff is required for streaming because the final size is not known
+    # and may exceed 4 GB.
+    kwargs = {}
+    if shape is not None:
+        kwargs["shape"] = shape
+        kwargs["dtype"] = dtype
+        kwargs["bigtiff"] = True
     tifffile.imwrite(
         filepath,
         volume,
         photometric="minisblack",
-        metadata={
-            # "axes" tells Bio-Formats the axis order of the array so it does
-            # not have to guess. TCZYX is the standard OME axis order.
-            "axes": "TCZYX",
-            "PhysicalSizeX": vox.x, "PhysicalSizeXUnit": "µm",
-            "PhysicalSizeY": vox.y, "PhysicalSizeYUnit": "µm",
-            "PhysicalSizeZ": vox.z, "PhysicalSizeZUnit": "µm",
-            "TimeIncrement": period_s, "TimeIncrementUnit": "s",
-            # Channel names are passed as a dict so tifffile formats them
-            # into the OME-XML <Channel Name="..."> attribute.
-            "Channel": {"Name": channel_names},
-        },
+        metadata=metadata,
+        **kwargs,
     )
+
+
+
+def concatenate_tifs(tif_paths, output_path, axis=0):
+    """Concatenate multiple OME-TIFFs along a chosen axis.
+
+    Joins a set of OME-TIFF files by concatenating along the specified
+    axis (default 0, which is T in TCZYX volumes). Input files are sorted
+    by filename before concatenation — ND2 files are named sequentially
+    by the microscope (nd1188, nd1189, ...), so alphabetical order
+    corresponds to acquisition time order.
+
+    All dimensions except the concatenation axis must match across files.
+    A mismatch is raised as an error.
+
+    OME metadata is compared across files. Inconsistencies are printed as
+    warnings but do not prevent concatenation. The OME-XML from the first
+    file is passed through to the output.
+
+    Data is streamed to the output one input file at a time using
+    tifffile's append mode, so only one input file's data is in memory
+    at any point.
+
+    Parameters
+    ----------
+    tif_paths : list of str or Path
+        Paths to OME-TIFF files.
+    output_path : str or Path
+        Destination path for the concatenated OME-TIFF.
+    axis : int, default 0
+        Axis along which to concatenate. 0=T, 1=C, 2=Z, 3=Y, 4=X for
+        TCZYX volumes.
+    """
+    # Sort by filename so that files from sequentially named ND2s
+    # (nd1188, nd1189, ...) are concatenated in acquisition order.
+    # Alphabetical sorting works because the microscope assigns ascending
+    # numeric suffixes within each session.
+    sorted_paths = sorted(tif_paths, key=lambda p: Path(p).name)
+
+    # Collect array shapes and OME-XML metadata from each file before
+    # loading any pixel data. This pass is used to verify that all files
+    # have compatible dimensions and consistent metadata before committing
+    # to the concatenation.
+    shapes = []
+    ome_xmls = []
+    for path in sorted_paths:
+        # TiffFile opens the file and parses the TIFF header and any
+        # OME-XML in the ImageDescription tag. series[0].shape gives the
+        # full array shape without reading pixel data into memory.
+        # ome_metadata returns the OME-XML as a string if present, or
+        # None for plain TIFFs that have no OME block.
+        f = tifffile.TiffFile(path)
+        shapes.append(f.series[0].shape)
+        ome_xmls.append(f.ome_metadata)
+        f.close()
+
+    # Verify that all dimensions except the concatenation axis match.
+    # For example, when concatenating along axis 0 (T) with shape
+    # (T, C, Z, Y, X), the C, Z, Y, X values must be identical across
+    # all files. Files with different spatial dimensions or channel counts
+    # cannot be concatenated into a single coherent volume.
+    ref_shape = shapes[0]
+    for i, shape in enumerate(shapes[1:], start=1):
+        for dim in range(len(ref_shape)):
+            if dim == axis:
+                continue
+            if shape[dim] != ref_shape[dim]:
+                raise ValueError(
+                    f"Dimension mismatch on axis {dim}: "
+                    f"{Path(sorted_paths[0]).name} has {ref_shape[dim]} "
+                    f"but {Path(sorted_paths[i]).name} has {shape[dim]}."
+                )
+
+    # Compare OME metadata across files. The OME-XML string encodes
+    # voxel sizes, channel names, and time calibration. Files from the
+    # same imaging session should have identical metadata, but slight
+    # differences (e.g. floating-point rounding in voxel size between
+    # acquisition runs) can occur without affecting the image data.
+    # These are printed as warnings rather than raised as errors so the
+    # user is aware but concatenation still proceeds.
+    ref_ome = ome_xmls[0]
+    if ref_ome is not None:
+        for i, ome in enumerate(ome_xmls[1:], start=1):
+            if ome is None:
+                tqdm.write(
+                    f"Warning: {Path(sorted_paths[i]).name} has no OME metadata"
+                )
+            elif ome != ref_ome:
+                tqdm.write(
+                    f"Warning: OME metadata in {Path(sorted_paths[i]).name} "
+                    f"differs from {Path(sorted_paths[0]).name}"
+                )
+
+    total_along_axis = sum(s[axis] for s in shapes)
+    tqdm.write(f"Concatenating {len(sorted_paths)} files -> {total_along_axis} total along axis {axis}")
+
+    # Parse the first file's OME-XML to extract physical calibration
+    # (voxel sizes, time interval, channel names). These values are
+    # passed to TiffWriter as a metadata dict so that tifffile generates
+    # a fresh OME-XML header whose dimension counts (SizeT, SizeC, SizeZ)
+    # match the actual number of pages in the concatenated output.
+    # Passing the raw XML string directly would preserve the original
+    # SizeT from a single ND2 file, causing Fiji to misread the axes.
+    import xml.etree.ElementTree as ET
+
+    ome_metadata = {"axes": "TCZYX"}
+    if ref_ome is not None:
+        root = ET.fromstring(ref_ome)
+        # OME-XML wraps every tag in its namespace, e.g.
+        # {http://www.openmicroscopy.org/Schemas/OME/2016-06}Pixels.
+        # Extracting the namespace from the root tag lets us find
+        # child elements without assuming a specific schema version.
+        ns = root.tag.split("}")[0] + "}" if "}" in root.tag else ""
+        pixels = root.find(f".//{ns}Pixels")
+        if pixels is not None:
+            for attr in ["PhysicalSizeX", "PhysicalSizeY", "PhysicalSizeZ", "TimeIncrement"]:
+                val = pixels.get(attr)
+                if val is not None:
+                    ome_metadata[attr] = float(val)
+            for attr in ["PhysicalSizeXUnit", "PhysicalSizeYUnit", "PhysicalSizeZUnit", "TimeIncrementUnit"]:
+                val = pixels.get(attr)
+                if val is not None:
+                    ome_metadata[attr] = val
+
+        # Channel names (Venus, mCherry, TD, etc.) so Fiji labels them
+        # correctly in the channel manager instead of showing "C=0".
+        channels = root.findall(f".//{ns}Channel")
+        if channels:
+            names = [ch.get("Name") for ch in channels if ch.get("Name")]
+            if names:
+                ome_metadata["Channel"] = {"Name": names}
+
+    # Build the full output shape by summing along the concatenation
+    # axis. The remaining dimensions (C, Z, Y, X) come from the first
+    # file since they were already verified to match across all inputs.
+    out_shape = list(ref_shape)
+    out_shape[axis] = total_along_axis
+    out_shape = tuple(out_shape)
+
+    def page_generator():
+        """Yield 2D (Y, X) pages from each input file in order.
+
+        Each file's 5D array (T, C, Z, Y, X) is flattened to (T*C*Z, Y, X)
+        so that every confocal plane becomes one TIFF page. Reading and
+        flattening one file at a time keeps peak memory at the size of a
+        single input file rather than the full concatenated volume.
+        """
+        for path in tqdm(sorted_paths, desc="Concatenating", unit="file"):
+            data = tifffile.imread(path).astype(np.float32)
+            yield from data.reshape(-1, data.shape[-2], data.shape[-1])
+            del data
+
+    # imwrite with a generator and an explicit shape lets tifffile
+    # stream pages to disk while knowing the full 5D dimensions
+    # upfront. It generates a single OME Image element with the
+    # correct SizeT, SizeC, SizeZ, voxel sizes, and channel names.
+    tifffile.imwrite(
+        output_path,
+        page_generator(),
+        shape=out_shape,
+        dtype=np.float32,
+        bigtiff=True,
+        photometric="minisblack",
+        metadata=ome_metadata,
+    )
+
+    tqdm.write(f"Done. Output: {output_path}")
 
 
 # ── Display utilities ─────────────────────────────────────────────────────────
@@ -735,3 +1124,97 @@ def make_grid_frame(images, nrows=2, ncols=2):
         grid[r * H : (r + 1) * H, c * W : (c + 1) * W] = img
 
     return grid
+
+
+def encode_mp4(frame_generator, output_path, fps=2):
+    """
+    Consumes a generator of RGB image frames and encodes them to an HEVC (H.265) MP4.
+    Uses Apple's hardware encoder (hevc_videotoolbox) for speed, falling back to 
+    CPU (libx265) if the hardware encoder is unavailable.
+    """
+    # Pull the first frame to get the video dimensions.
+    # If the generator is empty, we just exit cleanly.
+    try:
+        first_frame = next(frame_generator)
+    except StopIteration:
+        tqdm.write(f"Warning: No frames generated for {output_path.name}")
+        return
+
+    height, width, _ = first_frame.shape
+
+    # Base FFmpeg command setup for raw RGB24 input via a pipe.
+    # -y overwrites the output if it already exists.
+    # -f rawvideo and -pix_fmt rgb24 tell FFmpeg the exact format of our numpy arrays.
+    cmd_base = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-s", f"{width}x{height}",
+        "-pix_fmt", "rgb24",
+        "-r", str(fps),
+        "-i", "-", # Instructs FFmpeg to read video data from standard input
+    ]
+
+    # Try hardware acceleration first, then fallback to CPU software encoding.
+    # -tag:v hvc1 ensures the resulting HEVC file is playable in QuickTime/macOS.
+    encoders_to_try = [
+        (["-c:v", "hevc_videotoolbox", "-b:v", "5M", "-tag:v", "hvc1"], "Hardware (VideoToolbox)"),
+        (["-c:v", "libx265", "-crf", "23", "-preset", "medium", "-tag:v", "hvc1"], "Software (libx265)")
+    ]
+
+    for encoder_args, encoder_name in encoders_to_try:
+        cmd = cmd_base + encoder_args + [str(output_path)]
+        
+        # Spin up the FFmpeg subprocess. stderr=subprocess.DEVNULL keeps the console clean,
+        # otherwise FFmpeg prints a massive amount of output per frame.
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        
+        try:
+            # Write the first frame we grabbed earlier to the FFmpeg pipe.
+            process.stdin.write(first_frame.tobytes())
+            
+            # Pipe the rest of the frames directly from the generator to FFmpeg.
+            for frame in frame_generator:
+                process.stdin.write(frame.tobytes())
+                
+            # Close stdin to signal FFmpeg that the video stream is done, then wait for it to finish.
+            process.stdin.close()
+            process.wait()
+            
+            if process.returncode == 0:
+                # Success! Break out of the fallback loop.
+                return
+            else:
+                raise RuntimeError(f"FFmpeg exited with code {process.returncode}")
+                
+        except (BrokenPipeError, RuntimeError):
+            # If the pipe breaks immediately (e.g., codec not found), the hardware encoder failed.
+            tqdm.write(f"\n[!] {encoder_name} encoding failed. Attempting fallback...")
+            
+            # Since codec failures happen on initialization (the first frame), we only 
+            # reach this if we haven't consumed the rest of the generator yet.
+            if encoder_name == encoders_to_try[-1][1]:
+                tqdm.write(f"Error: All encoding methods failed for {output_path.name}")
+
+def tiff_to_mp4(tif_path, output_path, channel_index, fps=2):
+    """
+    Reads a standard (T, C, Z, Y, X) OME-TIFF from disk, max-projects the 
+    specified channel, and encodes it directly to an MP4 using encode_mp4.
+    """
+    # Read the metadata from the file to get the channel name
+    channel_names, _, _ = load_tif_metadata(tif_path)
+    ch_name = channel_names[channel_index]
+
+    with tifffile.TiffFile(tif_path) as tif:
+        series = tif.series[0] # .series is a method of the TiffFile object that returns the first series of the file. 
+        T, C, Z, Y, X = series.shape # shape is written by save_ome_tiff as (T, C, Z, Y, X). 
+
+        def generate_frames():
+            for t in tqdm(range(T), desc=f"    Encoding {ch_name}", unit="frame", leave=False): # leave=False means don't show the progress bar at the end.
+                frame = np.stack([series.pages[t*C*Z + i].asarray() for i in range(C*Z)]).reshape(C, Z, Y, X).astype(np.float32)
+                proj = auto_contrast(frame[channel_index].max(axis=0))
+                yield np.stack([proj, proj, proj], axis=-1)
+
+        tqdm.write(f"\nStarting encode to: {output_path.name}")
+        encode_mp4(generate_frames(), output_path, fps)
+        tqdm.write(f"Done! Video saved at: {output_path}")

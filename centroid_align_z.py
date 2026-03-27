@@ -23,16 +23,26 @@ value is the un-rounded centroid difference and is provided for future
 automated acquisition scripts that will command the stage by an exact
 physical amount rather than a rounded slice count.
 
+--enlarge_canvas
+    By default, shifting the Z stack discards slices that move outside the
+    original Z range. With --enlarge_canvas the script runs two passes:
+    the first computes all shifts without touching the data; the second
+    pads the Z dimension asymmetrically (matching the --enlarge_canvas
+    behaviour of centroid_align_xy.py) so that no original slice is ever
+    overwritten by the zero-fill. The output stack has more Z slices than
+    the input. Downstream tools (Fiji, napari) handle the larger stack
+    correctly provided the OME-TIFF physical metadata is read.
+
 Usage:
     python centroid_align_z.py nd1188_Venus_threshold.yaml
     python centroid_align_z.py nd1188_Venus_threshold.yaml --ref_t 5
     python centroid_align_z.py nd1188_Venus_threshold.yaml --ch_idx 1
+    python centroid_align_z.py nd1188_Venus_threshold.yaml --enlarge_canvas
 """
 
 import argparse
-import glob
-import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import tifffile
@@ -75,6 +85,16 @@ def main():
              "are shifted to match this frame's Z centroid so the anatomy stays "
              "at the same Z slice across T. (default: 0)",
     )
+    parser.add_argument(
+        "--enlarge_canvas",
+        action="store_true",
+        help=(
+            "Precompute all Z shifts, then expand the Z dimension "
+            "asymmetrically before aligning so no slice data is lost. "
+            "Mirrors the --enlarge_canvas behaviour of centroid_align_xy.py. "
+            "The output stack will have more Z slices than the input."
+        ),
+    )
     args = parser.parse_args()
 
     # ── 1. Load YAML config ───────────────────────────────────────────────────
@@ -82,9 +102,9 @@ def main():
     with open(args.yaml_file) as f:
         cfg = yaml.safe_load(f)
 
-    nd2_path = cfg["source"]["file"]
+    nd2_path = Path(cfg["source"]["file"])
 
-    if not os.path.isfile(nd2_path):
+    if not nd2_path.is_file():
         print(f"Error: ND2 file not found: {nd2_path}", file=sys.stderr)
         sys.exit(1)
 
@@ -103,10 +123,10 @@ def main():
 
     # ── 3. Find XY-aligned TIFFs ──────────────────────────────────────────────
 
-    base        = os.path.splitext(os.path.basename(nd2_path))[0]
-    aligned_dir = os.path.join(os.path.dirname(nd2_path) or ".", f"aligned_{base}")
+    base        = nd2_path.stem
+    aligned_dir = nd2_path.parent / f"aligned_{base}"
 
-    if not os.path.isdir(aligned_dir):
+    if not aligned_dir.is_dir():
         print(f"Error: aligned directory not found: {aligned_dir}", file=sys.stderr)
         print("Run centroid_align_xy.py first to produce XY-aligned TIFFs.",
               file=sys.stderr)
@@ -116,8 +136,8 @@ def main():
     # by centroid_align_xy.py. Files ending in _z.ome.tif are excluded so that
     # re-running this script on the same directory does not process its own
     # previous output.
-    tiff_paths = sorted(glob.glob(os.path.join(aligned_dir, f"{base}_P*.ome.tif")))
-    tiff_paths = [p for p in tiff_paths if not p.endswith("_z.ome.tif")]
+    tiff_paths = sorted(aligned_dir.glob(f"{base}_P*.ome.tif"))
+    tiff_paths = [p for p in tiff_paths if not p.name.endswith("_z.ome.tif")]
 
     if not tiff_paths:
         print(f"Error: no XY-aligned TIFFs found in {aligned_dir}", file=sys.stderr)
@@ -130,7 +150,7 @@ def main():
 
     print(f"\nAligning {P} embryo(s) ...")
     for tiff_path in tiff_paths:
-        p_label = os.path.basename(tiff_path)
+        p_label = tiff_path.name
         print(f"\n  {p_label}")
 
         # tifffile.imread reads the OME-TIFF and respects the TCZYX axis order
@@ -156,24 +176,80 @@ def main():
         print(f"    Reference Z centroid (t={ref_t}): {reference_centroid:.3f} slices"
               f"  ({reference_centroid * vox.z:.2f} µm)")
 
-        corrected = np.zeros_like(volume)
+        if args.enlarge_canvas:
+            # ── Two-pass path: enlarge canvas ─────────────────────────────────
+            # Pass 1: compute all shifts without modifying the volume.
+            # Printing each shift as it arrives lets the user see the drift
+            # pattern before any data is written, matching the --enlarge_canvas
+            # behaviour of centroid_align_xy.py.
+            print(f"\n--- Pass 1: precomputing Z shifts ---")
+            all_dz = np.zeros(T, dtype=int)
+            for t in range(T):
+                dz_slices, _ = compute_shift_z(
+                    volume[t], args.ch_idx, reference_centroid, vox.z
+                )
+                all_dz[t] = dz_slices
 
-        for t in tqdm(range(T), desc="    Aligning Z", unit="frame", leave=True):
-            # compute_shift_z computes the current centroid, compares it to
-            # reference_centroid, and prints the dz for this frame. Both the
-            # integer slice shift (for the image) and the µm value (for future
-            # stage control) are returned, though only dz_slices is used here.
-            dz_slices, dz_um = compute_shift_z(
-                volume[t], args.ch_idx, reference_centroid, vox.z
+            print(f"\n    Shift summary (slices):")
+            print(f"      min={all_dz.min():+d}  max={all_dz.max():+d}  "
+                  f"mean={all_dz.mean():+.1f}")
+
+            # Asymmetric padding: positive shifts move content toward higher Z
+            # indices, so the high end of the stack would be lost without extra
+            # slices there. Negative shifts move content toward lower Z indices,
+            # so the low end would be lost. This mirrors the top/bottom padding
+            # logic in centroid_align_xy.py --enlarge_canvas.
+            pad_high = int(np.ceil(max(0,  all_dz.max())))
+            pad_low  = int(np.ceil(max(0, -all_dz.min())))
+            print(f"    Z canvas padding: low={pad_low}  high={pad_high}")
+
+            # np.pad with (pad_low, pad_high) on the Z axis (axis 2 in
+            # (T, C, Z, Y, X)). All other axes are unchanged.
+            volume = np.pad(
+                volume,
+                ((0, 0), (0, 0), (pad_low, pad_high), (0, 0), (0, 0)),
             )
-            corrected[t] = align_frame_z(volume[t], dz_slices)
+            _, _, Z_padded, _, _ = volume.shape
+            print(f"    Expanded Z: {Z} → {Z_padded} slices")
+
+            # Pass 2: apply precomputed shifts on the expanded volume.
+            # We reuse align_frame_z with the already-computed all_dz values
+            # rather than calling compute_shift_z again, for the same reason
+            # centroid_align_xy.py avoids recomputing centroids on the padded
+            # canvas: the padding zeros would shift the percentile threshold
+            # and produce incorrect results.
+            print(f"\n--- Pass 2: applying Z shifts ---")
+            corrected = np.zeros_like(volume)
+            for t in tqdm(range(T), desc="    Aligning Z", unit="frame", leave=True):
+                corrected[t] = align_frame_z(volume[t], all_dz[t])
+
+        else:
+            # ── Single-pass path (default) ────────────────────────────────────
+            # Shifts are computed and applied in one pass. Slices that move
+            # outside the original Z range are replaced with zeros, so some
+            # data is lost when the shift is large. Use --enlarge_canvas to
+            # avoid this.
+            corrected = np.zeros_like(volume)
+            for t in tqdm(range(T), desc="    Aligning Z", unit="frame", leave=True):
+                # compute_shift_z computes the current centroid, compares it to
+                # reference_centroid, and prints the dz for this frame. Both the
+                # integer slice shift (for the image) and the µm value (for
+                # future stage control) are returned, though only dz_slices is
+                # used here.
+                dz_slices, _ = compute_shift_z(
+                    volume[t], args.ch_idx, reference_centroid, vox.z
+                )
+                corrected[t] = align_frame_z(volume[t], dz_slices)
 
         # Insert _z before .ome.tif to produce the output filename, making it
         # clear this file has had both XY and Z correction applied.
-        out_path = tiff_path.replace(".ome.tif", "_z.ome.tif")
-        print(f"    Saving {os.path.basename(out_path)} ...")
+        # with_name operates only on the filename component, never touching
+        # directory separators — unlike a bare str.replace on the full path,
+        # which would corrupt the path if ".ome.tif" appeared in a directory name.
+        out_path = tiff_path.with_name(tiff_path.name.replace(".ome.tif", "_z.ome.tif"))
+        print(f"    Saving {out_path.name} ...")
         save_ome_tiff(out_path, corrected, channel_names, vox, period_s)
-        print(f"    Saved {os.path.basename(out_path)}")
+        print(f"    Saved {out_path.name}")
 
     print("\nDone.")
 

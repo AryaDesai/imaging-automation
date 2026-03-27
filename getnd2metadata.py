@@ -11,11 +11,12 @@ Edit FILE_PATH before running.
 """
 
 import nd2
+from pathlib import Path
 
 from useful_functions import load_nd2_metadata
 
 # ── edit this ──────────────────────────────────────────────────────────────────
-FILE_PATH = "nd1188.nd2"
+FILE_PATH = Path("nd1188.nd2")
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── pipeline metadata ──────────────────────────────────────────────────────────
