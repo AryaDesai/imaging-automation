@@ -136,6 +136,11 @@ def main():
         out_dir = tif_path.parent / f"aligned_{base}"
         print(f"  Shape: T={T}, C={C}, Z={Z}, Y={Y}, X={X}")
 
+        def _read_tif_frame(t, h, w):
+            """Read timepoint t from the TIF as a (C, Z, h, w) float32 array."""
+            return np.stack([series.pages[t*C*Z + i].asarray()
+                             for i in range(C*Z)]).reshape(C, Z, h, w).astype(np.float32)
+
     print(f"  Channels: {channel_names}")
     print(f"  Threshold channel: {channel_names[ch_idx]} (index {ch_idx})")
     print(f"  sigma={sigma}, percentile={percentile}")
@@ -166,9 +171,7 @@ def main():
                     frame = data[t, p].transpose(1, 0, 2, 3)
                 else:
                     # TIF pages are stored as individual 2-D (Y, X) planes in T × C × Z order.
-                    # Slicing t*C*Z : (t+1)*C*Z selects all C*Z planes for this timepoint,
-                    # stacking them gives (C*Z, Y, X), and reshape gives (C, Z, Y, X).
-                    frame = np.stack([series.pages[t*C*Z + i].asarray() for i in range(C*Z)]).reshape(C, Z, Y, X).astype(np.float32)
+                    frame = _read_tif_frame(t, Y, X)
                 if args.use_gpu:
                     dy, dx = compute_shift_xy_gpu(frame, sigma, percentile, ch_idx)
                 else:
@@ -244,30 +247,14 @@ def main():
                             # ND2 array was already padded above; axes are (Z, C, Y, X), transpose to (C, Z, Y, X).
                             frame = data[t, p].transpose(1, 0, 2, 3)
                         else:
-                            # Read the original (C, Z, Y_orig, X_orig) frame from the TIF,
-                            # then pad Y and X to match the expanded canvas dimensions.
-                            raw = np.stack([series.pages[t*C*Z + i].asarray() for i in range(C*Z)]).reshape(C, Z, Y_orig, X_orig).astype(np.float32)
+                            raw = _read_tif_frame(t, Y_orig, X_orig)
                             frame = np.pad(raw, ((0, 0), (0, 0), (pad_top, pad_bottom), (pad_left, pad_right)))
                         if args.use_gpu:
                             yield apply_shift_xy_gpu(frame, dy, dx).cpu().numpy().clip(0, 65535).astype(np.uint16)
                         else:
                             yield shift(frame, (0, 0, dy, dx), order=1, mode="constant", cval=0).clip(0, 65535).astype(np.uint16)
-                tifffile.imwrite(
-                    fpath,
-                    _generate_aligned_frames(),
-                    shape=(T, C, Z, Y, X),
-                    dtype=np.uint16,
-                    photometric="minisblack",
-                    metadata={
-                        "axes": "TCZYX",
-                        "PhysicalSizeX": vox.x, "PhysicalSizeXUnit": "µm",
-                        "PhysicalSizeY": vox.y, "PhysicalSizeYUnit": "µm",
-                        "PhysicalSizeZ": vox.z, "PhysicalSizeZUnit": "µm",
-                        "TimeIncrement": period_s, "TimeIncrementUnit": "s",
-                        "Channel": {"Name": channel_names},
-                    },
-                    bigtiff=True,
-                )
+                save_ome_tiff(fpath, _generate_aligned_frames(), channel_names, vox, period_s,
+                             shape=(T, C, Z, Y, X), dtype=np.uint16)
                 print(f"    Saved {fpath.name}")
             else:
                 # Always allocate volume in numpy. GPU path processes each frame on
@@ -280,9 +267,7 @@ def main():
                         # ND2 array was already padded above; axes are (Z, C, Y, X), transpose to (C, Z, Y, X).
                         frame = data[t, p].transpose(1, 0, 2, 3)
                     else:
-                        # Read the original (C, Z, Y_orig, X_orig) frame from the TIF,
-                        # then pad Y and X to match the expanded canvas dimensions.
-                        raw = np.stack([series.pages[t*C*Z + i].asarray() for i in range(C*Z)]).reshape(C, Z, Y_orig, X_orig).astype(np.float32)
+                        raw = _read_tif_frame(t, Y_orig, X_orig)
                         frame = np.pad(raw, ((0, 0), (0, 0), (pad_top, pad_bottom), (pad_left, pad_right)))
                     if args.use_gpu:
                         volume[t] = apply_shift_xy_gpu(frame, dy, dx).cpu().numpy().clip(0, 65535).astype(np.uint16)
@@ -290,7 +275,6 @@ def main():
                         volume[t] = shift(frame, (0, 0, dy, dx), order=1, mode="constant", cval=0).clip(0, 65535).astype(np.uint16)
 
                 print(f"    Saving {fpath.name} ...")
-                # Change dtype=np.float32 TO dtype=np.uint16 to save disk space and time. We do not need the precision of float32.
                 save_ome_tiff(fpath, volume, channel_names, vox, period_s)
                 print(f"    Saved {fpath.name}")
             if not args.use_nd2:
@@ -344,30 +328,15 @@ def main():
                             # Reorder from ND2 axis order (Z, C, Y, X) to pipeline order (C, Z, Y, X).
                             frame = data[t, p].transpose(1, 0, 2, 3)
                         else:
-                            # Read all C*Z pages for this timepoint lazily and reshape to (C, Z, Y, X).
-                            frame = np.stack([series.pages[t*C*Z + i].asarray() for i in range(C*Z)]).reshape(C, Z, Y, X).astype(np.float32)
+                            frame = _read_tif_frame(t, Y, X)
                         if args.use_gpu:
                             shifted, dy, dx = align_frame_xy_gpu(frame, sigma, percentile, ch_idx)
                             yield shifted.cpu().numpy().astype(np.uint16)
                         else:
                             shifted, dy, dx = align_frame_xy(frame, sigma, percentile, ch_idx)
                             yield shifted.clip(0, 65535).astype(np.uint16)
-                tifffile.imwrite(
-                    fpath,
-                    _generate_aligned_frames(),
-                    shape=(T, C, Z, Y, X),
-                    dtype=np.uint16,
-                    photometric="minisblack",
-                    metadata={
-                        "axes": "TCZYX",
-                        "PhysicalSizeX": vox.x, "PhysicalSizeXUnit": "µm",
-                        "PhysicalSizeY": vox.y, "PhysicalSizeYUnit": "µm",
-                        "PhysicalSizeZ": vox.z, "PhysicalSizeZUnit": "µm",
-                        "TimeIncrement": period_s, "TimeIncrementUnit": "s",
-                        "Channel": {"Name": channel_names},
-                    },
-                    bigtiff=True,
-                )
+                save_ome_tiff(fpath, _generate_aligned_frames(), channel_names, vox, period_s,
+                             shape=(T, C, Z, Y, X), dtype=np.uint16)
                 print(f"    Saved {fpath.name}")
             else:
                 # Always allocate volume in numpy. GPU path processes each frame on
@@ -378,8 +347,7 @@ def main():
                         # Reorder from ND2 axis order (Z, C, Y, X) to pipeline order (C, Z, Y, X).
                         frame = data[t, p].transpose(1, 0, 2, 3)
                     else:
-                        # Read all C*Z pages for this timepoint lazily and reshape to (C, Z, Y, X).
-                        frame = np.stack([series.pages[t*C*Z + i].asarray() for i in range(C*Z)]).reshape(C, Z, Y, X).astype(np.float32)
+                        frame = _read_tif_frame(t, Y, X)
                     if args.use_gpu:
                         shifted, dy, dx = align_frame_xy_gpu(frame, sigma, percentile, ch_idx)
                         volume[t] = shifted.cpu().numpy().astype(np.uint16)  # We convert the float32 to uint16 to save disk space and time.
@@ -389,7 +357,6 @@ def main():
                         volume[t] = shifted.clip(0, 65535).astype(np.uint16)  # We convert the float32 to uint16 to save disk space and time.
 
                 print(f"    Saving {fpath.name} ...")
-                # Change dtype=np.float32 TO dtype=np.uint16 to save disk space and time. We do not need the precision of float32.
                 save_ome_tiff(fpath, volume, channel_names, vox, period_s)
                 print(f"    Saved {fpath.name}")
             if not args.use_nd2:

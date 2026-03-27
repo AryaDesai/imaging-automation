@@ -813,8 +813,9 @@ def align_frame_z(frame, dz_slices):
 
 # ── Format conversion ─────────────────────────────────────────────────────────
 
-def save_ome_tiff(filepath, volume, channel_names, vox, period_s):
-    """Write a (T, C, Z, Y, X) float32 volume as an OME-TIFF with full physical metadata.
+def save_ome_tiff(filepath, volume, channel_names, vox, period_s,
+                  shape=None, dtype=None):
+    """Write a (T, C, Z, Y, X) volume as an OME-TIFF with full physical metadata.
 
     OME-TIFF is chosen as the output format because it embeds physical pixel
     size, channel names, and acquisition timing in a standardised XML block
@@ -831,8 +832,9 @@ def save_ome_tiff(filepath, volume, channel_names, vox, period_s):
     filepath : str or Path
         Full destination path including filename, e.g.
         "/data/aligned_nd1188/nd1188_P0.ome.tif".
-    volume : ndarray, shape (T, C, Z, Y, X), dtype float32
-        The aligned image stack for one embryo position.
+    volume : ndarray or generator
+        When an ndarray, shape (T, C, Z, Y, X). When a generator, must yield
+        one (C, Z, Y, X) frame per timepoint, and shape/dtype must be provided.
     channel_names : list of str
         Channel names in the same order as the C axis (e.g. ["Venus", "BF"]).
         Written into the OME metadata so channels are labelled correctly in
@@ -843,28 +845,37 @@ def save_ome_tiff(filepath, volume, channel_names, vox, period_s):
         than in arbitrary pixel units.
     period_s : float or None
         Time between frames in seconds from load_nd2. Written as TimeIncrement
-        so the time axis is correctly calibrated. None is safe to pass — Fiji
+        so the time axis is correctly calibrated. None is safe to pass -- Fiji
         will simply leave the time axis uncalibrated.
+    shape : tuple, optional
+        Required when volume is a generator. The full (T, C, Z, Y, X) shape
+        so tifffile can write the OME-XML header before consuming frames.
+    dtype : numpy dtype, optional
+        Required when volume is a generator. The pixel dtype (e.g. np.uint16).
     """
-    # photometric="minisblack" tells readers that low values = black (dark),
-    # high values = bright signal. This is the correct convention for
-    # fluorescence microscopy; the alternative "miniswhite" would invert the LUT.
+    metadata = {
+        "axes": "TCZYX",
+        "PhysicalSizeX": vox.x, "PhysicalSizeXUnit": "µm",
+        "PhysicalSizeY": vox.y, "PhysicalSizeYUnit": "µm",
+        "PhysicalSizeZ": vox.z, "PhysicalSizeZUnit": "µm",
+        "TimeIncrement": period_s, "TimeIncrementUnit": "s",
+        "Channel": {"Name": channel_names},
+    }
+    # When volume is a generator, shape and dtype must be declared upfront so
+    # tifffile can write the OME-XML header before consuming any frames.
+    # bigtiff is required for streaming because the final size is not known
+    # and may exceed 4 GB.
+    kwargs = {}
+    if shape is not None:
+        kwargs["shape"] = shape
+        kwargs["dtype"] = dtype
+        kwargs["bigtiff"] = True
     tifffile.imwrite(
         filepath,
         volume,
         photometric="minisblack",
-        metadata={
-            # "axes" tells Bio-Formats the axis order of the array so it does
-            # not have to guess. TCZYX is the standard OME axis order.
-            "axes": "TCZYX",
-            "PhysicalSizeX": vox.x, "PhysicalSizeXUnit": "µm",
-            "PhysicalSizeY": vox.y, "PhysicalSizeYUnit": "µm",
-            "PhysicalSizeZ": vox.z, "PhysicalSizeZUnit": "µm",
-            "TimeIncrement": period_s, "TimeIncrementUnit": "s",
-            # Channel names are passed as a dict so tifffile formats them
-            # into the OME-XML <Channel Name="..."> attribute.
-            "Channel": {"Name": channel_names},
-        },
+        metadata=metadata,
+        **kwargs,
     )
 
 
