@@ -9,6 +9,7 @@ imaging session.
 Usage:
     python nd2_to_tif.py /path/to/nd2_folder
     python nd2_to_tif.py /path/to/nd2_folder --output_dir /path/to/output
+    python nd2_to_tif.py /path/to/nd2_folder --position 0
 """
 
 import argparse
@@ -44,6 +45,12 @@ def main():
         default=True,
         help="Process positions in parallel using threads (default: True).",
     )
+    parser.add_argument(
+        "--position",
+        type=int,
+        default=None,
+        help="Extract only this specific embryo position index (e.g., 0).",
+    )
     args = parser.parse_args()
 
     nd2_folder = Path(args.nd2_folder)
@@ -77,7 +84,7 @@ def main():
         data = f.to_dask()                          # lazy array, shape (T, P, Z, C, Y, X)
         T, P, Z, C, Y, X = data.shape
         print(f"  Shape: T={T}, P={P}, Z={Z}, C={C}, Y={Y}, X={X}")
-
+        target_positions = [args.position] if args.position is not None else range(P)
         base = nd2_path.stem  # e.g. "nd1188"
 
         def convert_position(p):
@@ -90,15 +97,15 @@ def main():
             print(f"  Writing {out_path.name} ...")
             save_ome_tiff(out_path, volume, channel_names, vox, period_s)
 
-        if args.parallel:
+        if args.parallel and args.position is None:
             # The bottleneck per position is disk I/O: reading chunks from
             # the ND2 file via dask and writing the output TIF. A thread
             # pool lets one position's read overlap with another's write,
             # keeping the disk busy instead of idling between positions.
-            with ThreadPoolExecutor(max_workers=P) as pool:
-                pool.map(convert_position, range(P))
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                pool.map(convert_position, target_positions)
         else:
-            for p in range(P):
+            for p in target_positions:
                 convert_position(p)
 
         f.close()         # release the ND2 file handle
@@ -107,7 +114,7 @@ def main():
     # All *_P{p}.ome.tif files from different ND2s belong to the same
     # embryo and are joined into one continuous timelapse.
     print(f"\nConcatenating per-embryo TIFFs ...")
-    for p in range(P):
+    for p in target_positions:
         tifs_for_position = sorted(output_dir.glob(f"*_P{p}.ome.tif"))
         if len(tifs_for_position) < 2:
             print(f"  P{p}: only {len(tifs_for_position)} file(s), skipping concatenation")
