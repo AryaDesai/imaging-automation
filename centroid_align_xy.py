@@ -66,6 +66,11 @@ def main():
         action="store_true",
         help="Use GPU acceleration for alignment.",
     )
+    parser.add_argument(
+        "--low_memory",
+        action="store_true",
+        help="Stream aligned frames directly to disk via TiffWriter instead of accumulating the full volume in RAM before saving.",
+    )
     args = parser.parse_args()
 
     # ── 1. Load YAML config ───────────────────────────────────────────────────
@@ -218,25 +223,6 @@ def main():
         print(f"\n--- Pass 2: aligning {P} embryo(s) × {T} timepoints ---")
         for p in range(P):
             print(f"\n  Embryo {p}/{P-1}")
-            # Always allocate volume in numpy. GPU path processes each frame on
-            # GPU and moves the result back to CPU immediately this avoids
-            # allocating the full volume on GPU (which would OOM on large datasets).
-            volume = np.zeros((T, C, Z, Y, X), dtype=np.uint16)
-            for t in tqdm(range(T), desc="    Aligning", unit="frame", leave=True):
-                dy, dx = shifts[p, t]
-                if args.use_nd2:
-                    # ND2 array was already padded above; axes are (Z, C, Y, X), transpose to (C, Z, Y, X).
-                    frame = data[t, p].transpose(1, 0, 2, 3)
-                else:
-                    # Read the original (C, Z, Y_orig, X_orig) frame from the TIF,
-                    # then pad Y and X to match the expanded canvas dimensions.
-                    raw = np.stack([series.pages[t*C*Z + i].asarray() for i in range(C*Z)]).reshape(C, Z, Y_orig, X_orig).astype(np.float32)
-                    frame = np.pad(raw, ((0, 0), (0, 0), (pad_top, pad_bottom), (pad_left, pad_right)))
-                if args.use_gpu:
-                    volume[t] = apply_shift_xy_gpu(frame, dy, dx).cpu().numpy().clip(0, 65535).astype(np.uint16)
-                else:
-                    volume[t] = shift(frame, (0, 0, dy, dx), order=1, mode="constant", cval=0).clip(0, 65535).astype(np.uint16)
-
             if args.use_nd2:
                 fpath = out_dir / f"{base}_P{p}.ome.tif"
             else:
@@ -245,10 +231,68 @@ def main():
                 if stem.endswith(".ome"):
                     stem = stem[:-4]
                 fpath = out_dir / f"{stem}_xy.ome.tif"
-            print(f"    Saving {fpath.name} ...")
-            # Change dtype=np.float32 TO dtype=np.uint16 to save disk space and time. We do not need the precision of float32.
-            save_ome_tiff(fpath, volume, channel_names, vox, period_s)
-            print(f"    Saved {fpath.name}")
+            if args.low_memory:
+                # Pass a generator to imwrite so frames are consumed one at a time
+                # without accumulating the full volume in RAM. shape and dtype are
+                # declared upfront so tifffile writes correct OME-XML before consuming
+                # any frames.
+                print(f"    Saving {fpath.name} (streaming) ...")
+                def _generate_aligned_frames():
+                    for t in tqdm(range(T), desc="    Aligning", unit="frame", leave=True):
+                        dy, dx = shifts[p, t]
+                        if args.use_nd2:
+                            # ND2 array was already padded above; axes are (Z, C, Y, X), transpose to (C, Z, Y, X).
+                            frame = data[t, p].transpose(1, 0, 2, 3)
+                        else:
+                            # Read the original (C, Z, Y_orig, X_orig) frame from the TIF,
+                            # then pad Y and X to match the expanded canvas dimensions.
+                            raw = np.stack([series.pages[t*C*Z + i].asarray() for i in range(C*Z)]).reshape(C, Z, Y_orig, X_orig).astype(np.float32)
+                            frame = np.pad(raw, ((0, 0), (0, 0), (pad_top, pad_bottom), (pad_left, pad_right)))
+                        if args.use_gpu:
+                            yield apply_shift_xy_gpu(frame, dy, dx).cpu().numpy().clip(0, 65535).astype(np.uint16)
+                        else:
+                            yield shift(frame, (0, 0, dy, dx), order=1, mode="constant", cval=0).clip(0, 65535).astype(np.uint16)
+                tifffile.imwrite(
+                    fpath,
+                    _generate_aligned_frames(),
+                    shape=(T, C, Z, Y, X),
+                    dtype=np.uint16,
+                    photometric="minisblack",
+                    metadata={
+                        "axes": "TCZYX",
+                        "PhysicalSizeX": vox.x, "PhysicalSizeXUnit": "µm",
+                        "PhysicalSizeY": vox.y, "PhysicalSizeYUnit": "µm",
+                        "PhysicalSizeZ": vox.z, "PhysicalSizeZUnit": "µm",
+                        "TimeIncrement": period_s, "TimeIncrementUnit": "s",
+                        "Channel": {"Name": channel_names},
+                    },
+                    bigtiff=True,
+                )
+                print(f"    Saved {fpath.name}")
+            else:
+                # Always allocate volume in numpy. GPU path processes each frame on
+                # GPU and moves the result back to CPU immediately this avoids
+                # allocating the full volume on GPU (which would OOM on large datasets).
+                volume = np.zeros((T, C, Z, Y, X), dtype=np.uint16)
+                for t in tqdm(range(T), desc="    Aligning", unit="frame", leave=True):
+                    dy, dx = shifts[p, t]
+                    if args.use_nd2:
+                        # ND2 array was already padded above; axes are (Z, C, Y, X), transpose to (C, Z, Y, X).
+                        frame = data[t, p].transpose(1, 0, 2, 3)
+                    else:
+                        # Read the original (C, Z, Y_orig, X_orig) frame from the TIF,
+                        # then pad Y and X to match the expanded canvas dimensions.
+                        raw = np.stack([series.pages[t*C*Z + i].asarray() for i in range(C*Z)]).reshape(C, Z, Y_orig, X_orig).astype(np.float32)
+                        frame = np.pad(raw, ((0, 0), (0, 0), (pad_top, pad_bottom), (pad_left, pad_right)))
+                    if args.use_gpu:
+                        volume[t] = apply_shift_xy_gpu(frame, dy, dx).cpu().numpy().clip(0, 65535).astype(np.uint16)
+                    else:
+                        volume[t] = shift(frame, (0, 0, dy, dx), order=1, mode="constant", cval=0).clip(0, 65535).astype(np.uint16)
+
+                print(f"    Saving {fpath.name} ...")
+                # Change dtype=np.float32 TO dtype=np.uint16 to save disk space and time. We do not need the precision of float32.
+                save_ome_tiff(fpath, volume, channel_names, vox, period_s)
+                print(f"    Saved {fpath.name}")
             if not args.use_nd2:
                 print(f"Closing the TIF file ...")
                 tif_file.close()
@@ -280,24 +324,6 @@ def main():
         print(f"\nAligning {P} embryo(s) × {T} timepoints ...")
         for p in range(P):
             print(f"\n  Embryo {p}/{P-1}")
-            # Always allocate volume in numpy. GPU path processes each frame on
-            # GPU and moves the result back to CPU immediately.
-            volume = np.zeros((T, C, Z, Y, X), dtype=np.uint16)
-            for t in tqdm(range(T), desc="    Aligning timepoints", unit="frame", leave=True):
-                if args.use_nd2:
-                    # Reorder from ND2 axis order (Z, C, Y, X) to pipeline order (C, Z, Y, X).
-                    frame = data[t, p].transpose(1, 0, 2, 3)
-                else:
-                    # Read all C*Z pages for this timepoint lazily and reshape to (C, Z, Y, X).
-                    frame = np.stack([series.pages[t*C*Z + i].asarray() for i in range(C*Z)]).reshape(C, Z, Y, X).astype(np.float32)
-                if args.use_gpu:
-                    shifted, dy, dx = align_frame_xy_gpu(frame, sigma, percentile, ch_idx)
-                    volume[t] = shifted.cpu().numpy().astype(np.uint16)  # We convert the float32 to uint16 to save disk space and time.
-
-                else:
-                    shifted, dy, dx = align_frame_xy(frame, sigma, percentile, ch_idx)
-                    volume[t] = shifted.clip(0, 65535).astype(np.uint16)  # We convert the float32 to uint16 to save disk space and time.
-
             if args.use_nd2:
                 fpath = out_dir / f"{base}_P{p}.ome.tif"
             else:
@@ -306,10 +332,66 @@ def main():
                 if stem.endswith(".ome"):
                     stem = stem[:-4]
                 fpath = out_dir / f"{stem}_xy.ome.tif"
-            print(f"    Saving {fpath.name} ...")
-            # Change dtype=np.float32 TO dtype=np.uint16 to save disk space and time. We do not need the precision of float32.
-            save_ome_tiff(fpath, volume, channel_names, vox, period_s)
-            print(f"    Saved {fpath.name}")
+            if args.low_memory:
+                # Pass a generator to imwrite so frames are consumed one at a time
+                # without accumulating the full volume in RAM. shape and dtype are
+                # declared upfront so tifffile writes correct OME-XML before consuming
+                # any frames.
+                print(f"    Saving {fpath.name} (streaming) ...")
+                def _generate_aligned_frames():
+                    for t in tqdm(range(T), desc="    Aligning timepoints", unit="frame", leave=True):
+                        if args.use_nd2:
+                            # Reorder from ND2 axis order (Z, C, Y, X) to pipeline order (C, Z, Y, X).
+                            frame = data[t, p].transpose(1, 0, 2, 3)
+                        else:
+                            # Read all C*Z pages for this timepoint lazily and reshape to (C, Z, Y, X).
+                            frame = np.stack([series.pages[t*C*Z + i].asarray() for i in range(C*Z)]).reshape(C, Z, Y, X).astype(np.float32)
+                        if args.use_gpu:
+                            shifted, dy, dx = align_frame_xy_gpu(frame, sigma, percentile, ch_idx)
+                            yield shifted.cpu().numpy().astype(np.uint16)
+                        else:
+                            shifted, dy, dx = align_frame_xy(frame, sigma, percentile, ch_idx)
+                            yield shifted.clip(0, 65535).astype(np.uint16)
+                tifffile.imwrite(
+                    fpath,
+                    _generate_aligned_frames(),
+                    shape=(T, C, Z, Y, X),
+                    dtype=np.uint16,
+                    photometric="minisblack",
+                    metadata={
+                        "axes": "TCZYX",
+                        "PhysicalSizeX": vox.x, "PhysicalSizeXUnit": "µm",
+                        "PhysicalSizeY": vox.y, "PhysicalSizeYUnit": "µm",
+                        "PhysicalSizeZ": vox.z, "PhysicalSizeZUnit": "µm",
+                        "TimeIncrement": period_s, "TimeIncrementUnit": "s",
+                        "Channel": {"Name": channel_names},
+                    },
+                    bigtiff=True,
+                )
+                print(f"    Saved {fpath.name}")
+            else:
+                # Always allocate volume in numpy. GPU path processes each frame on
+                # GPU and moves the result back to CPU immediately.
+                volume = np.zeros((T, C, Z, Y, X), dtype=np.uint16)
+                for t in tqdm(range(T), desc="    Aligning timepoints", unit="frame", leave=True):
+                    if args.use_nd2:
+                        # Reorder from ND2 axis order (Z, C, Y, X) to pipeline order (C, Z, Y, X).
+                        frame = data[t, p].transpose(1, 0, 2, 3)
+                    else:
+                        # Read all C*Z pages for this timepoint lazily and reshape to (C, Z, Y, X).
+                        frame = np.stack([series.pages[t*C*Z + i].asarray() for i in range(C*Z)]).reshape(C, Z, Y, X).astype(np.float32)
+                    if args.use_gpu:
+                        shifted, dy, dx = align_frame_xy_gpu(frame, sigma, percentile, ch_idx)
+                        volume[t] = shifted.cpu().numpy().astype(np.uint16)  # We convert the float32 to uint16 to save disk space and time.
+
+                    else:
+                        shifted, dy, dx = align_frame_xy(frame, sigma, percentile, ch_idx)
+                        volume[t] = shifted.clip(0, 65535).astype(np.uint16)  # We convert the float32 to uint16 to save disk space and time.
+
+                print(f"    Saving {fpath.name} ...")
+                # Change dtype=np.float32 TO dtype=np.uint16 to save disk space and time. We do not need the precision of float32.
+                save_ome_tiff(fpath, volume, channel_names, vox, period_s)
+                print(f"    Saved {fpath.name}")
             if not args.use_nd2:
                 print(f"Closing the TIF file ...")
                 tif_file.close()
