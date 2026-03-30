@@ -5,12 +5,10 @@ defined and maintained in one place. The individual run-scripts
 (centroid_align_xy.py, movie_from_nd2.py, find_threshold.py) are thin entry
 points that handle argument parsing and I/O only.
 
-A single flat file is used rather than a sub-package because the toolkit is
-small enough that one file is easier to audit, share, and extend. If the
-library grows substantially, splitting into sub-modules is straightforward
-once the API has stabilised.
+
 """
 
+import csv
 from pathlib import Path
 import subprocess
 import nd2
@@ -20,6 +18,7 @@ import torch
 import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter, label, shift
 from tqdm import tqdm
+import cv2  # TODO: Add skimage.filters.threshold_otsu fallback for outside distribution
 
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
@@ -204,6 +203,78 @@ def load_tif_metadata(file_path):
     return channel_names, vox, period_s
 
 
+class LazyTifReader:
+    """Lazy reader for OME-TIFFs that loads one timepoint at a time.
+
+    Opens the TIF file once and reads individual timepoints on demand via
+    tifffile page indexing, avoiding the need to load the entire volume into
+    memory. Each call to read_frame returns a (C, Z, Y, X) array in the
+    file's native dtype.
+
+    Parameters
+    ----------
+    file_path : str or Path
+        Path to an OME-TIFF written by save_ome_tiff with shape (T, C, Z, Y, X).
+    """
+
+    def __init__(self, file_path):
+        self.tif = tifffile.TiffFile(file_path)
+        self.series = self.tif.series[0]
+        self.T, self.C, self.Z, self.Y, self.X = self.series.shape
+        self._pages_per_t = self.C * self.Z
+        self.dtype = self.series.dtype
+
+    def read_frame(self, t):
+        """Return timepoint *t* as a (C, Z, Y, X) array in native dtype."""
+        start = t * self._pages_per_t
+        return np.stack(
+            [self.series.pages[start + i].asarray() for i in range(self._pages_per_t)]
+        ).reshape(self.C, self.Z, self.Y, self.X)
+
+    def close(self):
+        """Close the underlying TIF file handle."""
+        self.tif.close()
+
+
+class LazyNd2Reader:
+    """Lazy reader for ND2 files that loads one timepoint/position at a time.
+
+    Uses dask (bundled with the nd2 package) for lazy indexing so that only
+    the requested (C, Z, Y, X) subvolume is read from disk.
+
+    Parameters
+    ----------
+    file_path : str or Path
+        Path to a Nikon .nd2 file with shape (T, P, Z, C, Y, X).
+    """
+
+    def __init__(self, file_path):
+        self._nd2 = nd2.ND2File(file_path)
+        self._dask = self._nd2.to_dask()
+        sizes = self._nd2.sizes
+        self.T = sizes.get("T", 1)
+        self.P = sizes.get("P", 1)
+        self.Z = sizes.get("Z", 1)
+        self.C = sizes.get("C", 1)
+        self.Y = sizes.get("Y", 0)
+        self.X = sizes.get("X", 0)
+        self.channel_names = [ch.channel.name for ch in self._nd2.metadata.channels]
+        self.dtype = self._nd2.dtype
+
+    def read_frame(self, t, p=0):
+        """Return one timepoint and position as a (C, Z, Y, X) array.
+
+        The ND2 native axis order after indexing out T and P is (Z, C, Y, X).
+        We transpose to (C, Z, Y, X) to match LazyTifReader's convention.
+        """
+        frame = self._dask[t, p].compute()  # (Z, C, Y, X)
+        return frame.transpose(1, 0, 2, 3)  # (C, Z, Y, X)
+
+    def close(self):
+        """Close the underlying ND2 file handle."""
+        self._nd2.close()
+
+
 def max_project_z(data):
     """Collapse the Z axis of a (T, P, Z, C, Y, X) array by taking the maximum.
 
@@ -237,7 +308,7 @@ def max_project_z(data):
 # metrics across Z-slices rather than intensity centroids — and is not
 # addressed here.
 
-def find_largest_mask_xy(smoothed, percentile):
+def find_largest_mask_xy(smoothed, percentile, method='percentile'):
     """Threshold a 2-D image and return the mask and centroid of the largest blob.
 
     This is the core detection step shared by find_threshold.py (for overlay
@@ -245,10 +316,9 @@ def find_largest_mask_xy(smoothed, percentile):
     it once ensures that what the user sees in the Streamlit preview is exactly
     what the alignment script will detect.
 
-    We use a percentile threshold rather than a fixed intensity value because
-    ND2 files from different experiments have very different intensity ranges.
-    The percentile is tuned interactively in find_threshold.py and saved to
-    the YAML config.
+    The method parameter selects between percentile-only (the default), a global
+    Otsu threshold across the entire frame, or applying an Otsu refinement step
+    only after determining the ROI using the given percentile.
 
     We take the *largest* connected component rather than all components above
     threshold because in a multi-embryo field there can be small bright
@@ -269,7 +339,9 @@ def find_largest_mask_xy(smoothed, percentile):
     percentile : float
         Pixels above this percentile of the image are included in the binary
         mask. Typical values are 85–95 depending on how bright the embryo is
-        relative to background.
+        relative to background. Used when method 'percentile' or 'percentile_otsu_roi' is active.
+    method : str
+        One of 'percentile' (default), 'global_otsu', or 'percentile_otsu_roi'.
 
     Returns
     -------
@@ -280,10 +352,45 @@ def find_largest_mask_xy(smoothed, percentile):
         is found (e.g. a blank frame or threshold too high), returns the frame
         centre so that the downstream shift is zero and the frame is unchanged.
     """
-    # Binarise by thresholding at the given percentile of the smoothed image.
-    # Using the image's own percentile makes the threshold adaptive to
-    # per-frame intensity variation rather than requiring a fixed absolute value.
-    binary = smoothed > np.percentile(smoothed, percentile)
+    if method == "global_otsu":
+        vmin, vmax = smoothed.min(), smoothed.max()
+        if vmax > vmin:
+            uint8_img = np.clip((smoothed - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
+        else:
+            uint8_img = smoothed.astype(np.uint8)
+            
+        thresh_uint8, _ = cv2.threshold(uint8_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        thresh_float = thresh_uint8 / 255.0 * (vmax - vmin) + vmin
+        binary = smoothed > thresh_float
+        
+    else:
+        # Binarise by thresholding at the given percentile of the smoothed image.
+        binary_base = smoothed > np.percentile(smoothed, percentile)
+        
+        if method == "percentile_otsu_roi":
+            # Label connected components of the percentiled region to extract the ROI
+            labeled_base, _ = label(binary_base)
+            sizes_base = np.bincount(labeled_base.ravel())
+            sizes_base[0] = 0
+            
+            if sizes_base.max() == 0:
+                binary = binary_base
+            else:
+                roi_mask = labeled_base == sizes_base.argmax()
+                roi_pixels = smoothed[roi_mask]
+                
+                vmin, vmax = roi_pixels.min(), roi_pixels.max()
+                if vmax > vmin:
+                    uint8_roi = np.clip((roi_pixels - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
+                    uint8_roi_2d = uint8_roi.reshape(-1, 1)
+                    thresh_uint8, _ = cv2.threshold(uint8_roi_2d, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    
+                    thresh_float = thresh_uint8 / 255.0 * (vmax - vmin) + vmin
+                    binary = smoothed > thresh_float
+                else:
+                    binary = binary_base
+        else:
+            binary = binary_base
 
     # Label connected components. Default 4-connectivity is sufficient for
     # detecting embryo blobs; 8-connectivity would merge diagonally adjacent
@@ -315,7 +422,7 @@ def find_largest_mask_xy(smoothed, percentile):
     return mask, centroid
 
 
-def compute_shift_xy(frame, sigma, percentile, ch_idx):
+def compute_shift_xy(frame, sigma, percentile, ch_idx, method='percentile'):
     """Return the (dy, dx) translation that moves the embryo centroid to the frame centre.
 
     This function answers: "by how many pixels must we shift this frame so
@@ -368,7 +475,7 @@ def compute_shift_xy(frame, sigma, percentile, ch_idx):
 
     # Detect the largest blob and get its centroid in pixel coordinates.
     # The mask is discarded here; only the centroid coordinates are needed.
-    _, centroid = find_largest_mask_xy(smoothed, percentile)
+    _, centroid = find_largest_mask_xy(smoothed, percentile, method)
     cy, cx = centroid[0], centroid[1]
 
     # The target position is the frame centre (Y/2, X/2).
@@ -392,7 +499,7 @@ def compute_shift_xy(frame, sigma, percentile, ch_idx):
     return dy, dx
 
 
-def compute_shift_xy_gpu(frame, sigma, percentile, ch_idx):
+def compute_shift_xy_gpu(frame, sigma, percentile, ch_idx, method='percentile'):
     """GPU-accelerated version of compute_shift_xy.
 
     Gaussian blur runs on GPU; connected-component labeling stays on CPU.
@@ -416,7 +523,7 @@ def compute_shift_xy_gpu(frame, sigma, percentile, ch_idx):
     # Squeeze to (Y, X) and pull to CPU for connected-component labeling.
     smoothed = smoothed_gpu.squeeze().cpu().numpy()
 
-    _, centroid = find_largest_mask_xy(smoothed, percentile)
+    _, centroid = find_largest_mask_xy(smoothed, percentile, method)
     cy, cx = centroid[0], centroid[1]
 
     # dy > 0 when the embryo is above centre → shift image downward.
@@ -428,7 +535,7 @@ def compute_shift_xy_gpu(frame, sigma, percentile, ch_idx):
     return dy, dx
 
 
-def align_frame_xy(frame, sigma, percentile, ch_idx):
+def align_frame_xy(frame, sigma, percentile, ch_idx, method='percentile'):
     """Compute the centring shift and apply it to all channels and Z-slices.
 
     This is the single-pass alignment function used in the default (no
@@ -461,7 +568,7 @@ def align_frame_xy(frame, sigma, percentile, ch_idx):
     dy, dx : float
         The shift that was applied. Returned so the caller can log it.
     """
-    dy, dx = compute_shift_xy(frame, sigma, percentile, ch_idx)
+    dy, dx = compute_shift_xy(frame, sigma, percentile, ch_idx, method)
 
     # Apply the same (dy, dx) shift to every channel and Z-slice simultaneously.
     # The (0, 0) entries for the C and Z axes ensure those axes are untouched.
@@ -487,7 +594,7 @@ def _gaussian_kernel_2d(sigma, device="mps"):
     return kernel.reshape(1, 1, size, size)
 
 
-def align_frame_xy_gpu(frame, sigma, percentile, ch_idx):
+def align_frame_xy_gpu(frame, sigma, percentile, ch_idx, method='percentile'):
     """GPU-accelerated version of align_frame_xy.
 
     Gaussian blur and integer-pixel shift run on GPU. Connected-component
@@ -516,7 +623,7 @@ def align_frame_xy_gpu(frame, sigma, percentile, ch_idx):
     # Pull the small blurred 2D image to CPU for connected-component labeling.
     smoothed = smoothed_gpu.squeeze().cpu().numpy()  # (Y, X)
 
-    _, centroid = find_largest_mask_xy(smoothed, percentile)
+    _, centroid = find_largest_mask_xy(smoothed, percentile, method)
     cy, cx = centroid[0], centroid[1]
 
     dy = Y / 2 - cy
@@ -809,6 +916,8 @@ def align_frame_z(frame, dz_slices):
         shifted[:, :Z - dz, :, :] = frame[:, dz:, :, :]
 
     return shifted
+
+
 
 
 # ── Format conversion ─────────────────────────────────────────────────────────
