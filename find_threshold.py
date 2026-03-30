@@ -293,15 +293,25 @@ class ThresholdApp:
                  variable=self.sigma_var,
                  command=lambda _: self._update()).pack(fill=tk.X, pady=(0, 10))
 
+        # ── Method selector ───────────────────────────────────────────────
+        ttk.Label(ctrl, text="Threshold Method").pack(anchor=tk.W)
+        self.method_var = tk.StringVar(value="Percentile")
+        self.method_combo = ttk.Combobox(ctrl, textvariable=self.method_var,
+                                         state="readonly", width=20)
+        self.method_combo["values"] = ["Percentile", "Global Otsu", "Percentile -> Otsu ROI"]
+        self.method_combo.pack(fill=tk.X, pady=(0, 10))
+        self.method_combo.bind("<<ComboboxSelected>>", lambda _: self._on_method_change())
+
         # ── Percentile slider ─────────────────────────────────────────────
         # Pixels above this percentile of the smoothed image are included
         # in the binary mask. Lower values include more background; higher
         # values restrict the mask to only the brightest regions.
         ttk.Label(ctrl, text="Percentile").pack(anchor=tk.W)
         self.pct_var = tk.DoubleVar(value=90.0)
-        tk.Scale(ctrl, from_=10.0, to=99.5, orient=tk.HORIZONTAL,
-                 resolution=0.5, variable=self.pct_var,
-                 command=lambda _: self._update()).pack(fill=tk.X, pady=(0, 10))
+        self.pct_slider = tk.Scale(ctrl, from_=10.0, to=99.5, orient=tk.HORIZONTAL,
+                                   resolution=0.5, variable=self.pct_var,
+                                   command=lambda _: self._update())
+        self.pct_slider.pack(fill=tk.X, pady=(0, 10))
 
         # ── Animation controls ────────────────────────────────────────────
         ttk.Separator(ctrl).pack(fill=tk.X, pady=5)
@@ -431,6 +441,15 @@ class ThresholdApp:
 
     # ── Rendering ─────────────────────────────────────────────────────────
 
+    def _on_method_change(self):
+        """Enable/disable Percentile slider based on method and trigger update."""
+        method = self.method_var.get()
+        if method == "Global Otsu":
+            self.pct_slider.config(state=tk.DISABLED)
+        else:
+            self.pct_slider.config(state=tk.NORMAL)
+        self._update()
+
     def _update(self):
         """Recompute the mask and redraw the embryo image.
 
@@ -451,10 +470,18 @@ class ThresholdApp:
         sigma = self.sigma_var.get()
         percentile = self.pct_var.get()
         channel = self.channel_names[ch_idx]
+        
+        ui_method = self.method_var.get()
+        method_map = {
+            "Percentile": "percentile",
+            "Global Otsu": "global_otsu",
+            "Percentile -> Otsu ROI": "percentile_otsu_roi"
+        }
+        method = method_map.get(ui_method, "percentile")
 
         self.header_var.set(
             f"T = {t}  |  {channel}  |  sigma = {sigma}  |  "
-            f"percentile = {percentile}")
+            f"method = {method}  |  percentile = {percentile}")
 
         # Extract the 2-D image for the current (t, p, ch) combination.
         img = self.max_proj[t, p, ch_idx]
@@ -467,7 +494,7 @@ class ThresholdApp:
         # threshold. This is the same function used by centroid_align_xy.py
         # so that the mask the user sees here is exactly what the alignment
         # script will detect.
-        mask, centroid = find_largest_mask_xy(smoothed, percentile)
+        mask, centroid = find_largest_mask_xy(smoothed, percentile, method=method)
 
         # Render the composite image and scale it for display.
         pil_img = render_embryo(img, mask, centroid)
@@ -544,11 +571,19 @@ class ThresholdApp:
         channel = self.channel_names[ch_idx]
         sigma = self.sigma_var.get()
         percentile = self.pct_var.get()
+        
+        ui_method = self.method_var.get()
+        method_map = {
+            "Percentile": "percentile",
+            "Global Otsu": "global_otsu",
+            "Percentile -> Otsu ROI": "percentile_otsu_roi"
+        }
+        method = method_map.get(ui_method, "percentile")
 
         t = self.t_var.get()
         img = self.max_proj[t, p, ch_idx]
         smoothed = gaussian_filter(img, sigma=sigma)
-        mask, centroid = find_largest_mask_xy(smoothed, percentile)
+        mask, centroid = find_largest_mask_xy(smoothed, percentile, method=method)
         area = int(mask.sum())
 
         output = {
@@ -557,6 +592,7 @@ class ThresholdApp:
                 "channel_index": ch_idx,
                 "sigma": sigma,
                 "percentile": percentile,
+                "method": method,
             },
             "source": {
                 "file": str(Path(self.file_path)),
