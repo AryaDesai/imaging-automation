@@ -82,6 +82,7 @@ def main():
     sigma      = cfg["parameters"]["sigma"]
     percentile = cfg["parameters"]["percentile"]
     ch_idx     = cfg["parameters"]["channel_index"]
+    method     = cfg["parameters"].get("method", "percentile")
 
     # ── 2. Load image data ────────────────────────────────────────────────────
 
@@ -143,7 +144,7 @@ def main():
 
     print(f"  Channels: {channel_names}")
     print(f"  Threshold channel: {channel_names[ch_idx]} (index {ch_idx})")
-    print(f"  sigma={sigma}, percentile={percentile}")
+    print(f"  sigma={sigma}, percentile={percentile}, method={method}")
 
     # ── 3. Prepare output directory ───────────────────────────────────────────
 
@@ -173,9 +174,9 @@ def main():
                     # TIF pages are stored as individual 2-D (Y, X) planes in T × C × Z order.
                     frame = _read_tif_frame(t, Y, X)
                 if args.use_gpu:
-                    dy, dx = compute_shift_xy_gpu(frame, sigma, percentile, ch_idx)
+                    dy, dx = compute_shift_xy_gpu(frame, sigma, percentile, ch_idx, method=method)
                 else:
-                    dy, dx = compute_shift_xy(frame, sigma, percentile, ch_idx)
+                    dy, dx = compute_shift_xy(frame, sigma, percentile, ch_idx, method=method)
                 shifts[p, t] = [dy, dx]
 
         dy_all, dx_all = shifts[:, :, 0], shifts[:, :, 1]
@@ -330,10 +331,10 @@ def main():
                         else:
                             frame = _read_tif_frame(t, Y, X)
                         if args.use_gpu:
-                            shifted, dy, dx = align_frame_xy_gpu(frame, sigma, percentile, ch_idx)
+                            shifted, dy, dx = align_frame_xy_gpu(frame, sigma, percentile, ch_idx, method=method)
                             yield shifted.cpu().numpy().astype(np.uint16)
                         else:
-                            shifted, dy, dx = align_frame_xy(frame, sigma, percentile, ch_idx)
+                            shifted, dy, dx = align_frame_xy(frame, sigma, percentile, ch_idx, method=method)
                             yield shifted.clip(0, 65535).astype(np.uint16)
                 save_ome_tiff(fpath, _generate_aligned_frames(), channel_names, vox, period_s,
                              shape=(T, C, Z, Y, X), dtype=np.uint16)
@@ -349,11 +350,11 @@ def main():
                     else:
                         frame = _read_tif_frame(t, Y, X)
                     if args.use_gpu:
-                        shifted, dy, dx = align_frame_xy_gpu(frame, sigma, percentile, ch_idx)
+                        shifted, dy, dx = align_frame_xy_gpu(frame, sigma, percentile, ch_idx, method=method)
                         volume[t] = shifted.cpu().numpy().astype(np.uint16)  # We convert the float32 to uint16 to save disk space and time.
 
                     else:
-                        shifted, dy, dx = align_frame_xy(frame, sigma, percentile, ch_idx)
+                        shifted, dy, dx = align_frame_xy(frame, sigma, percentile, ch_idx, method=method)
                         volume[t] = shifted.clip(0, 65535).astype(np.uint16)  # We convert the float32 to uint16 to save disk space and time.
 
                 print(f"    Saving {fpath.name} ...")
