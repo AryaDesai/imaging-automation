@@ -40,13 +40,11 @@ from useful_functions import (
     align_frame_xy,
     align_frame_xy_gpu,
     apply_shift_xy_gpu,
-    auto_contrast,
     compute_shift_xy,
     compute_shift_xy_gpu,
     load_nd2,
     load_tif_metadata,
     save_ome_tiff,
-    encode_mp4,
     tiff_to_mp4,
 )
 
@@ -83,6 +81,8 @@ def main():
     percentile = cfg["parameters"]["percentile"]
     ch_idx     = cfg["parameters"]["channel_index"]
     method     = cfg["parameters"].get("method", "percentile")
+    block_size = cfg["parameters"].get("block_size", 64)
+    invert     = cfg["parameters"].get("invert", False)
 
     # ── 2. Load image data ────────────────────────────────────────────────────
 
@@ -144,7 +144,12 @@ def main():
 
     print(f"  Channels: {channel_names}")
     print(f"  Threshold channel: {channel_names[ch_idx]} (index {ch_idx})")
-    print(f"  sigma={sigma}, percentile={percentile}, method={method}")
+    h_str = f"  sigma={sigma}, percentile={percentile}, method={method}"
+    if "local_otsu" in method:
+        h_str += f", block_size={block_size}"
+    if invert:
+        h_str += ", invert=True"
+    print(h_str)
 
     # ── 3. Prepare output directory ───────────────────────────────────────────
 
@@ -174,9 +179,9 @@ def main():
                     # TIF pages are stored as individual 2-D (Y, X) planes in T × C × Z order.
                     frame = _read_tif_frame(t, Y, X)
                 if args.use_gpu:
-                    dy, dx = compute_shift_xy_gpu(frame, sigma, percentile, ch_idx, method=method)
+                    dy, dx = compute_shift_xy_gpu(frame, sigma, percentile, ch_idx, method=method, block_size=block_size, invert=invert)
                 else:
-                    dy, dx = compute_shift_xy(frame, sigma, percentile, ch_idx, method=method)
+                    dy, dx = compute_shift_xy(frame, sigma, percentile, ch_idx, method=method, block_size=block_size, invert=invert)
                 shifts[p, t] = [dy, dx]
 
         dy_all, dx_all = shifts[:, :, 0], shifts[:, :, 1]
@@ -331,10 +336,10 @@ def main():
                         else:
                             frame = _read_tif_frame(t, Y, X)
                         if args.use_gpu:
-                            shifted, dy, dx = align_frame_xy_gpu(frame, sigma, percentile, ch_idx, method=method)
+                            shifted, dy, dx = align_frame_xy_gpu(frame, sigma, percentile, ch_idx, method=method, block_size=block_size, invert=invert)
                             yield shifted.cpu().numpy().astype(np.uint16)
                         else:
-                            shifted, dy, dx = align_frame_xy(frame, sigma, percentile, ch_idx, method=method)
+                            shifted, dy, dx = align_frame_xy(frame, sigma, percentile, ch_idx, method=method, block_size=block_size, invert=invert)
                             yield shifted.clip(0, 65535).astype(np.uint16)
                 save_ome_tiff(fpath, _generate_aligned_frames(), channel_names, vox, period_s,
                              shape=(T, C, Z, Y, X), dtype=np.uint16)
@@ -350,11 +355,11 @@ def main():
                     else:
                         frame = _read_tif_frame(t, Y, X)
                     if args.use_gpu:
-                        shifted, dy, dx = align_frame_xy_gpu(frame, sigma, percentile, ch_idx, method=method)
+                        shifted, dy, dx = align_frame_xy_gpu(frame, sigma, percentile, ch_idx, method=method, block_size=block_size, invert=invert)
                         volume[t] = shifted.cpu().numpy().astype(np.uint16)  # We convert the float32 to uint16 to save disk space and time.
 
                     else:
-                        shifted, dy, dx = align_frame_xy(frame, sigma, percentile, ch_idx, method=method)
+                        shifted, dy, dx = align_frame_xy(frame, sigma, percentile, ch_idx, method=method, block_size=block_size, invert=invert)
                         volume[t] = shifted.clip(0, 65535).astype(np.uint16)  # We convert the float32 to uint16 to save disk space and time.
 
                 print(f"    Saving {fpath.name} ...")
