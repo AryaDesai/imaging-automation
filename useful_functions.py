@@ -308,7 +308,119 @@ def max_project_z(data):
 # metrics across Z-slices rather than intensity centroids — and is not
 # addressed here.
 
-def find_largest_mask_xy(smoothed, percentile, method='percentile'):
+# ── Helper threshold functions ───────────────────────────────────────────────
+
+def _threshold_percentile(smoothed, percentile):
+    return smoothed > np.percentile(smoothed, percentile)
+
+def _threshold_global_otsu(smoothed):
+    vmin, vmax = smoothed.min(), smoothed.max()
+    if vmax > vmin:
+        uint8_img = np.clip((smoothed - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
+    else:
+        uint8_img = smoothed.astype(np.uint8)
+        
+    thresh_uint8, _ = cv2.threshold(uint8_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thresh_float = thresh_uint8 / 255.0 * (vmax - vmin) + vmin
+    return smoothed > thresh_float
+
+def _threshold_percentile_otsu_roi(smoothed, percentile):
+    binary_base = _threshold_percentile(smoothed, percentile)
+    labeled_base, _ = label(binary_base)
+    sizes_base = np.bincount(labeled_base.ravel())
+    sizes_base[0] = 0
+    
+    if sizes_base.max() == 0:
+        return binary_base
+        
+    roi_mask = labeled_base == sizes_base.argmax()
+    roi_pixels = smoothed[roi_mask]
+    
+    vmin, vmax = roi_pixels.min(), roi_pixels.max()
+    if vmax > vmin:
+        uint8_roi = np.clip((roi_pixels - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
+        uint8_roi_2d = uint8_roi.reshape(-1, 1)
+        thresh_uint8, _ = cv2.threshold(uint8_roi_2d, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        thresh_float = thresh_uint8 / 255.0 * (vmax - vmin) + vmin
+        return smoothed > thresh_float
+    return binary_base
+
+def _threshold_local_otsu_torch(smoothed, percentile, block_size=32, interp=True):
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    H, W = smoothed.shape
+    vmin, vmax = smoothed.min(), smoothed.max()
+    
+    if vmax <= vmin:
+        return smoothed > vmin
+        
+    smoothed_t = torch.tensor(smoothed, dtype=torch.float32, device=device)
+    img_scaled = ((smoothed_t - vmin) / (vmax - vmin) * 255.0).clamp(0, 255).to(torch.uint8)
+    bins = torch.arange(256, device=device, dtype=torch.float32)
+    
+    def batched_otsu(patches):
+        B, P = patches.shape
+        hist = torch.zeros(B, 256, device=device)
+        hist.scatter_add_(1, patches.long(), torch.ones_like(patches, dtype=torch.float32))
+        
+        weight1 = hist.cumsum(dim=1)
+        weight2 = P - weight1
+        
+        cumsum_sum = (hist * bins.unsqueeze(0)).cumsum(dim=1)
+        total_mean = cumsum_sum[:, -1:]
+        
+        mean1 = cumsum_sum / (weight1 + 1e-8)
+        mean2 = (total_mean - cumsum_sum) / (weight2 + 1e-8)
+        
+        variance12 = weight1 * weight2 * (mean1 - mean2).pow(2)
+        return variance12.argmax(dim=1)
+        
+    if not interp:
+        # Pixel-by-pixel (Sliding window) Processed row-by-row to try and avoid memory OOM
+        pad_left = block_size // 2
+        pad_right = pad_left - 1 if block_size % 2 == 0 else pad_left
+        pad_top = block_size // 2
+        pad_bottom = pad_top - 1 if block_size % 2 == 0 else pad_top
+        
+        padded = F.pad(img_scaled.float().unsqueeze(0).unsqueeze(0), 
+                       (pad_left, pad_right, pad_top, pad_bottom), mode='reflect').squeeze()
+        out_thresh = torch.zeros((H, W), dtype=torch.float32, device=device)
+        
+        for y in range(H):
+            band = padded[y : y + block_size, :] 
+            band_4d = band.unsqueeze(0).unsqueeze(0)
+            patches = F.unfold(band_4d, kernel_size=block_size) 
+            patches = patches.squeeze(0).transpose(0, 1) 
+            row_thresh = batched_otsu(patches) 
+            out_thresh[y] = row_thresh.float()
+            
+        thresh_float = (out_thresh / 255.0) * (vmax - vmin) + vmin
+        local_mask = smoothed > thresh_float.cpu().numpy()
+        global_mask = smoothed > np.percentile(smoothed, percentile)
+        return local_mask & global_mask
+        
+    else:
+        # Block-Interpolated
+        grid_h, grid_w = max(1, H // block_size), max(1, W // block_size)
+        h_clean = grid_h * block_size
+        w_clean = grid_w * block_size
+        clean_img = img_scaled[:h_clean, :w_clean].unsqueeze(0).unsqueeze(0).float()
+        
+        patches = F.unfold(clean_img, kernel_size=block_size, stride=block_size)
+        patches = patches.squeeze(0).transpose(0, 1) 
+        
+        block_thresh = batched_otsu(patches) 
+        block_thresh_2d = block_thresh.view(1, 1, grid_h, grid_w).float()
+        
+        upscaled = F.interpolate(block_thresh_2d, size=(H, W), mode='bilinear', align_corners=False)
+        upscaled = upscaled.squeeze()
+        
+        thresh_float = (upscaled / 255.0) * (vmax - vmin) + vmin
+        local_mask = smoothed > thresh_float.cpu().numpy()
+        global_mask = smoothed > np.percentile(smoothed, percentile)
+        return local_mask & global_mask
+
+
+def find_largest_mask_xy(smoothed, percentile, method='percentile', block_size=32, invert=False):
     """Threshold a 2-D image and return the mask and centroid of the largest blob.
 
     This is the core detection step shared by find_threshold.py (for overlay
@@ -353,44 +465,18 @@ def find_largest_mask_xy(smoothed, percentile, method='percentile'):
         centre so that the downstream shift is zero and the frame is unchanged.
     """
     if method == "global_otsu":
-        vmin, vmax = smoothed.min(), smoothed.max()
-        if vmax > vmin:
-            uint8_img = np.clip((smoothed - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
-        else:
-            uint8_img = smoothed.astype(np.uint8)
-            
-        thresh_uint8, _ = cv2.threshold(uint8_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        thresh_float = thresh_uint8 / 255.0 * (vmax - vmin) + vmin
-        binary = smoothed > thresh_float
-        
+        binary = _threshold_global_otsu(smoothed)
+    elif method == "percentile_otsu_roi":
+        binary = _threshold_percentile_otsu_roi(smoothed, percentile)
+    elif method == "local_otsu_interp":
+        binary = _threshold_local_otsu_torch(smoothed, percentile, block_size=block_size, interp=True)
+    elif method == "local_otsu_pixel":
+        binary = _threshold_local_otsu_torch(smoothed, percentile, block_size=block_size, interp=False)
     else:
-        # Binarise by thresholding at the given percentile of the smoothed image.
-        binary_base = smoothed > np.percentile(smoothed, percentile)
+        binary = _threshold_percentile(smoothed, percentile)
         
-        if method == "percentile_otsu_roi":
-            # Label connected components of the percentiled region to extract the ROI
-            labeled_base, _ = label(binary_base)
-            sizes_base = np.bincount(labeled_base.ravel())
-            sizes_base[0] = 0
-            
-            if sizes_base.max() == 0:
-                binary = binary_base
-            else:
-                roi_mask = labeled_base == sizes_base.argmax()
-                roi_pixels = smoothed[roi_mask]
-                
-                vmin, vmax = roi_pixels.min(), roi_pixels.max()
-                if vmax > vmin:
-                    uint8_roi = np.clip((roi_pixels - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
-                    uint8_roi_2d = uint8_roi.reshape(-1, 1)
-                    thresh_uint8, _ = cv2.threshold(uint8_roi_2d, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                    
-                    thresh_float = thresh_uint8 / 255.0 * (vmax - vmin) + vmin
-                    binary = smoothed > thresh_float
-                else:
-                    binary = binary_base
-        else:
-            binary = binary_base
+    if invert:
+        binary = ~binary
 
     # Label connected components. Default 4-connectivity is sufficient for
     # detecting embryo blobs; 8-connectivity would merge diagonally adjacent
@@ -422,7 +508,7 @@ def find_largest_mask_xy(smoothed, percentile, method='percentile'):
     return mask, centroid
 
 
-def compute_shift_xy(frame, sigma, percentile, ch_idx, method='percentile'):
+def compute_shift_xy(frame, sigma, percentile, ch_idx, method='percentile', block_size=32, invert=False):
     """Return the (dy, dx) translation that moves the embryo centroid to the frame centre.
 
     This function answers: "by how many pixels must we shift this frame so
@@ -475,7 +561,7 @@ def compute_shift_xy(frame, sigma, percentile, ch_idx, method='percentile'):
 
     # Detect the largest blob and get its centroid in pixel coordinates.
     # The mask is discarded here; only the centroid coordinates are needed.
-    _, centroid = find_largest_mask_xy(smoothed, percentile, method)
+    _, centroid = find_largest_mask_xy(smoothed, percentile, method=method, block_size=block_size, invert=invert)
     cy, cx = centroid[0], centroid[1]
 
     # The target position is the frame centre (Y/2, X/2).
@@ -499,7 +585,7 @@ def compute_shift_xy(frame, sigma, percentile, ch_idx, method='percentile'):
     return dy, dx
 
 
-def compute_shift_xy_gpu(frame, sigma, percentile, ch_idx, method='percentile'):
+def compute_shift_xy_gpu(frame, sigma, percentile, ch_idx, method='percentile', block_size=32, invert=False):
     """GPU-accelerated version of compute_shift_xy.
 
     Gaussian blur runs on GPU; connected-component labeling stays on CPU.
@@ -523,7 +609,7 @@ def compute_shift_xy_gpu(frame, sigma, percentile, ch_idx, method='percentile'):
     # Squeeze to (Y, X) and pull to CPU for connected-component labeling.
     smoothed = smoothed_gpu.squeeze().cpu().numpy()
 
-    _, centroid = find_largest_mask_xy(smoothed, percentile, method)
+    _, centroid = find_largest_mask_xy(smoothed, percentile, method=method, block_size=block_size, invert=invert)
     cy, cx = centroid[0], centroid[1]
 
     # dy > 0 when the embryo is above centre → shift image downward.
@@ -535,7 +621,7 @@ def compute_shift_xy_gpu(frame, sigma, percentile, ch_idx, method='percentile'):
     return dy, dx
 
 
-def align_frame_xy(frame, sigma, percentile, ch_idx, method='percentile'):
+def align_frame_xy(frame, sigma, percentile, ch_idx, method='percentile', block_size=32, invert=False):
     """Compute the centring shift and apply it to all channels and Z-slices.
 
     This is the single-pass alignment function used in the default (no
@@ -568,7 +654,7 @@ def align_frame_xy(frame, sigma, percentile, ch_idx, method='percentile'):
     dy, dx : float
         The shift that was applied. Returned so the caller can log it.
     """
-    dy, dx = compute_shift_xy(frame, sigma, percentile, ch_idx, method)
+    dy, dx = compute_shift_xy(frame, sigma, percentile, ch_idx, method=method, block_size=block_size, invert=invert)
 
     # Apply the same (dy, dx) shift to every channel and Z-slice simultaneously.
     # The (0, 0) entries for the C and Z axes ensure those axes are untouched.
@@ -594,7 +680,7 @@ def _gaussian_kernel_2d(sigma, device="mps"):
     return kernel.reshape(1, 1, size, size)
 
 
-def align_frame_xy_gpu(frame, sigma, percentile, ch_idx, method='percentile'):
+def align_frame_xy_gpu(frame, sigma, percentile, ch_idx, method='percentile', block_size=32, invert=False):
     """GPU-accelerated version of align_frame_xy.
 
     Gaussian blur and integer-pixel shift run on GPU. Connected-component
@@ -620,10 +706,10 @@ def align_frame_xy_gpu(frame, sigma, percentile, ch_idx, method='percentile'):
     proj_4d = projection.reshape(1, 1, Y, X)
     smoothed_gpu = F.conv2d(proj_4d, kernel, padding=padding)
 
-    # Pull the small blurred 2D image to CPU for connected-component labeling.
+    # Pull the blurred 2D image to CPU for connected-component labeling.
     smoothed = smoothed_gpu.squeeze().cpu().numpy()  # (Y, X)
 
-    _, centroid = find_largest_mask_xy(smoothed, percentile, method)
+    _, centroid = find_largest_mask_xy(smoothed, percentile, method=method, block_size=block_size, invert=invert)
     cy, cx = centroid[0], centroid[1]
 
     dy = Y / 2 - cy
@@ -634,7 +720,7 @@ def align_frame_xy_gpu(frame, sigma, percentile, ch_idx, method='percentile'):
     idy = int(round(dy))
     idx = int(round(dx))
 
-    # Pad zeros on the side content shifts away from, then slice back to
+    # Pad zeros on the side content shifts away from then slice back to
     # original size. Exposed edges become zero, no wrapping occurs.
     padded = F.pad(t_frame, (max(idx, 0), max(-idx, 0), max(idy, 0), max(-idy, 0)))
     shifted_gpu = padded[:, :, max(-idy, 0):max(-idy, 0)+Y, max(-idx, 0):max(-idx, 0)+X]
