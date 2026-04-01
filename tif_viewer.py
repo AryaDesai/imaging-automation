@@ -1,10 +1,11 @@
-"""tif_viewer.py -- lazy OME-TIFF viewer with per-slice and max-projected display.
+"""tif_viewer.py -- lazy OME-TIFF and ND2 viewer with per-slice and max-projected display.
 
-PyQt6 desktop application for browsing OME-TIFF files produced by this
-pipeline. Loads one timepoint at a time via LazyTifReader so arbitrarily
-large files can be viewed without running out of memory.
+PyQt6 desktop application for browsing OME-TIFF and Nikon ND2 files.
+Loads one timepoint at a time via LazyTifReader or LazyNd2Reader so
+arbitrarily large files can be viewed without running out of memory.
 
 Controls:
+  - Position selector: switch between embryo positions (ND2 files only).
   - Channel selector: switch between fluorescent channels.
   - T slider: scrub through timepoints, with Play/Pause animation.
   - Z slider: view individual Z slices.
@@ -29,7 +30,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont
 
-from useful_functions import LazyTifReader, encode_mp4, load_tif_metadata
+from useful_functions import LazyTifReader, LazyNd2Reader, encode_mp4, load_tif_metadata
 
 
 # ── Display ──────────────────────────────────────────────────────────────────
@@ -114,7 +115,7 @@ class TifViewer(QMainWindow):
         # ── Data state ────────────────────────────────────────────────────
         self.reader = None
         self.channel_names = []
-        self.T = self.C = self.Z = self.Y = self.X = 0
+        self.T = self.P = self.C = self.Z = self.Y = self.X = 0
 
         # ── Animation state ───────────────────────────────────────────────
         self.playing = False
@@ -155,6 +156,15 @@ class TifViewer(QMainWindow):
         load_btn = QPushButton("Load")
         load_btn.clicked.connect(self._load_file)
         ctrl_layout.addWidget(load_btn)
+
+        # Position selector (ND2 only, hidden for TIFs)
+        self.pos_label = QLabel("Position")
+        ctrl_layout.addWidget(self.pos_label)
+        self.pos_combo = QComboBox()
+        self.pos_combo.currentIndexChanged.connect(self._update_view)
+        ctrl_layout.addWidget(self.pos_combo)
+        self.pos_label.hide()
+        self.pos_combo.hide()
 
         # Channel selector
         ctrl_layout.addWidget(QLabel("Channel"))
@@ -235,7 +245,8 @@ class TifViewer(QMainWindow):
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select OME-TIFF file", "", "TIFF files (*.tif);;All files (*.*)"
+            self, "Select image file", "",
+            "Image files (*.tif *.nd2);;TIFF files (*.tif);;ND2 files (*.nd2);;All files (*.*)"
         )
         if path:
             self.path_input.setText(path)
@@ -255,13 +266,33 @@ class TifViewer(QMainWindow):
         if self.reader is not None:
             self.reader.close()
 
-        self.channel_names, _, _ = load_tif_metadata(path)
-        self.reader = LazyTifReader(path)
+        ext = Path(path).suffix.lower()
+        if ext == ".nd2":
+            self.reader = LazyNd2Reader(path)
+            self.channel_names = self.reader.channel_names
+            self.P = self.reader.P
+        else:
+            self.reader = LazyTifReader(path)
+            self.channel_names, _, _ = load_tif_metadata(path)
+            self.P = 1
+
         self.T = self.reader.T
         self.C = self.reader.C
         self.Z = self.reader.Z
         self.Y = self.reader.Y
         self.X = self.reader.X
+
+        # Position selector: show only for multi-position files
+        self.pos_combo.blockSignals(True)
+        self.pos_combo.clear()
+        if self.P > 1:
+            self.pos_combo.addItems([str(p) for p in range(self.P)])
+            self.pos_label.show()
+            self.pos_combo.show()
+        else:
+            self.pos_label.hide()
+            self.pos_combo.hide()
+        self.pos_combo.blockSignals(False)
 
         self.channel_combo.clear()
         self.channel_combo.addItems(self.channel_names)
@@ -291,7 +322,11 @@ class TifViewer(QMainWindow):
 
     def _get_slice(self, t, ch_idx, z=None):
         """Return a 2-D (Y, X) image for the given t, channel, and z."""
-        frame = self.reader.read_frame(t)  # (C, Z, Y, X)
+        p = max(0, self.pos_combo.currentIndex()) if self.P > 1 else 0
+        if self.P > 1:
+            frame = self.reader.read_frame(t, p)  # (C, Z, Y, X)
+        else:
+            frame = self.reader.read_frame(t)  # (C, Z, Y, X)
         if z is None:
             return frame[ch_idx].max(axis=0)
         return frame[ch_idx, z]
@@ -310,7 +345,10 @@ class TifViewer(QMainWindow):
         channel = self.channel_names[ch_idx]
 
         z_label = "max" if self.max_projected else str(z)
-        self.header_label.setText(f"T={t}  |  {channel}  |  Z={z_label}")
+        header = f"T={t}  |  {channel}  |  Z={z_label}"
+        if self.P > 1:
+            header = f"P={self.pos_combo.currentIndex()}  |  " + header
+        self.header_label.setText(header)
 
         img = self._get_slice(t, ch_idx, z)
         gray = auto_contrast_uint8(img)
