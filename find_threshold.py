@@ -297,10 +297,26 @@ class ThresholdApp:
         ttk.Label(ctrl, text="Threshold Method").pack(anchor=tk.W)
         self.method_var = tk.StringVar(value="Percentile")
         self.method_combo = ttk.Combobox(ctrl, textvariable=self.method_var,
-                                         state="readonly", width=20)
-        self.method_combo["values"] = ["Percentile", "Global Otsu", "Percentile -> Otsu ROI"]
-        self.method_combo.pack(fill=tk.X, pady=(0, 10))
+                                         state="readonly", width=34)
+        self.method_combo["values"] = [
+            "Percentile", 
+            "Global Otsu", 
+            "Percentile -> Otsu ROI", 
+            "Local Otsu (Block-Interpolated)", 
+            "Local Otsu (Pixel-by-Pixel)"
+        ]
+        self.method_combo.pack(fill=tk.X, pady=(0, 5))
         self.method_combo.bind("<<ComboboxSelected>>", lambda _: self._on_method_change())
+
+        # ── Block Size selector ─────────────────────────────────────────────
+        self.block_label = ttk.Label(ctrl, text="Block Size (Local Otsu only)", state=tk.DISABLED)
+        self.block_label.pack(anchor=tk.W)
+        self.block_var = tk.IntVar(value=64)
+        self.block_combo = ttk.Combobox(ctrl, textvariable=self.block_var,
+                                         state=tk.DISABLED, width=20)
+        self.block_combo["values"] = [16, 32, 64, 128]
+        self.block_combo.pack(fill=tk.X, pady=(0, 10))
+        self.block_combo.bind("<<ComboboxSelected>>", lambda _: self._update())
 
         # ── Percentile slider ─────────────────────────────────────────────
         # Pixels above this percentile of the smoothed image are included
@@ -312,6 +328,11 @@ class ThresholdApp:
                                    resolution=0.5, variable=self.pct_var,
                                    command=lambda _: self._update())
         self.pct_slider.pack(fill=tk.X, pady=(0, 10))
+        
+        # ── Invert selector ───────────────────────────────────────────────
+        self.invert_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ctrl, text="Invert Mask", variable=self.invert_var,
+                        command=self._update).pack(anchor=tk.W, pady=(0, 10))
 
         # ── Animation controls ────────────────────────────────────────────
         ttk.Separator(ctrl).pack(fill=tk.X, pady=5)
@@ -442,12 +463,20 @@ class ThresholdApp:
     # ── Rendering ─────────────────────────────────────────────────────────
 
     def _on_method_change(self):
-        """Enable/disable Percentile slider based on method and trigger update."""
+        """Enable/disable controls based on method and trigger update."""
         method = self.method_var.get()
         if method == "Global Otsu":
             self.pct_slider.config(state=tk.DISABLED)
         else:
             self.pct_slider.config(state=tk.NORMAL)
+            
+        if "Local Otsu" in method:
+            self.block_label.config(state=tk.NORMAL)
+            self.block_combo.config(state="readonly")
+        else:
+            self.block_label.config(state=tk.DISABLED)
+            self.block_combo.config(state=tk.DISABLED)
+            
         self._update()
 
     def _update(self):
@@ -475,13 +504,23 @@ class ThresholdApp:
         method_map = {
             "Percentile": "percentile",
             "Global Otsu": "global_otsu",
-            "Percentile -> Otsu ROI": "percentile_otsu_roi"
+            "Percentile -> Otsu ROI": "percentile_otsu_roi",
+            "Local Otsu (Block-Interpolated)": "local_otsu_interp",
+            "Local Otsu (Pixel-by-Pixel)": "local_otsu_pixel"
         }
         method = method_map.get(ui_method, "percentile")
+        block_size = self.block_var.get()
+        invert = self.invert_var.get()
 
-        self.header_var.set(
+        h_str = (
             f"T = {t}  |  {channel}  |  sigma = {sigma}  |  "
-            f"method = {method}  |  percentile = {percentile}")
+            f"method = {method}  |  percentile = {percentile}"
+        )
+        if "local_otsu" in method:
+            h_str += f"  |  block = {block_size}"
+        if invert:
+            h_str += "  |  INVERTED"
+        self.header_var.set(h_str)
 
         # Extract the 2-D image for the current (t, p, ch) combination.
         img = self.max_proj[t, p, ch_idx]
@@ -494,7 +533,7 @@ class ThresholdApp:
         # threshold. This is the same function used by centroid_align_xy.py
         # so that the mask the user sees here is exactly what the alignment
         # script will detect.
-        mask, centroid = find_largest_mask_xy(smoothed, percentile, method=method)
+        mask, centroid = find_largest_mask_xy(smoothed, percentile, method=method, block_size=block_size, invert=invert)
 
         # Render the composite image and scale it for display.
         pil_img = render_embryo(img, mask, centroid)
@@ -576,24 +615,34 @@ class ThresholdApp:
         method_map = {
             "Percentile": "percentile",
             "Global Otsu": "global_otsu",
-            "Percentile -> Otsu ROI": "percentile_otsu_roi"
+            "Percentile -> Otsu ROI": "percentile_otsu_roi",
+            "Local Otsu (Block-Interpolated)": "local_otsu_interp",
+            "Local Otsu (Pixel-by-Pixel)": "local_otsu_pixel"
         }
         method = method_map.get(ui_method, "percentile")
+        block_size = self.block_var.get()
 
         t = self.t_var.get()
+        invert = self.invert_var.get()
+        
         img = self.max_proj[t, p, ch_idx]
         smoothed = gaussian_filter(img, sigma=sigma)
-        mask, centroid = find_largest_mask_xy(smoothed, percentile, method=method)
+        mask, centroid = find_largest_mask_xy(smoothed, percentile, method=method, block_size=block_size, invert=invert)
         area = int(mask.sum())
+        
+        params = {
+            "channel": channel,
+            "channel_index": ch_idx,
+            "sigma": sigma,
+            "percentile": percentile,
+            "method": method,
+            "invert": invert
+        }
+        if "local_otsu" in method:
+            params["block_size"] = block_size
 
         output = {
-            "parameters": {
-                "channel": channel,
-                "channel_index": ch_idx,
-                "sigma": sigma,
-                "percentile": percentile,
-                "method": method,
-            },
+            "parameters": params,
             "source": {
                 "file": str(Path(self.file_path)),
                 "image_shape": {
