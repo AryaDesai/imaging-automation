@@ -27,4 +27,4 @@ nd2_to_tif.py  →  find_threshold.py  →  YAML config  →  centroid_align_xy.
 pip install nd2 numpy scipy tifffile imageio Pillow matplotlib tqdm pyyaml torch
 ```
 
-FFmpeg must be installed separately (system binary, not a pip package) for MP4 encoding.
+FFmpeg should be installed separately (system binary, not a pip package) for MP4 encoding. It should work with pip as well, but to avoid issues use homebrew.
