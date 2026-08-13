@@ -1,8 +1,8 @@
-"""find_threshold.py — interactive threshold tuning for embryo masking.
 
-Tkinter desktop application for tuning Gaussian blur (sigma) and percentile
-threshold parameters on microscopy data. Displays one embryo at a time with
-a red mask overlay and cyan centroid crosshair so the user can visually
+""
+
+ Displays one embryo at a time with
+a  mask overlay and centroid crosshair so the user can visually
 confirm the mask quality before saving parameters to a YAML config.
 
 Supports two input formats:
@@ -32,10 +32,17 @@ import yaml
 from PIL import Image, ImageDraw, ImageTk
 from scipy.ndimage import gaussian_filter
 
-from useful_functions import find_largest_mask_xy, load_nd2, load_tif_metadata, max_project_z
+from useful_functions import (
+    MAX_OTSU_LEVELS,
+    find_largest_mask_xy,
+    load_nd2,
+    load_tif_metadata,
+    max_project_z,
+    multiotsu_class_map,
+)
 
 
-# ── Data loading ──────────────────────────────────────────────────────────────
+# Data loading
 
 
 class LazyTifAccessor:
@@ -125,10 +132,22 @@ def load_file(file_path):
     return accessor, accessor.channel_names, False
 
 
-# ── Rendering ─────────────────────────────────────────────────────────────────
+# Rendering
 
 
-def render_embryo(img, mask, centroid):
+# Overlay colour per intensity class, dark class first. Distinct hues rather
+# than a brightness ramp so that several checked classes stay tellable apart,
+# which a single-colour overlay could not do.
+LEVEL_COLORS = [
+    (255, 50, 50),    # red
+    (50, 200, 255),   # blue
+    (120, 255, 80),   # green
+    (255, 220, 40),   # yellow
+    (220, 100, 255),  # purple
+]
+
+
+def render_embryo(img, mask, centroid, class_map=None, selected_levels=None):
     """Grayscale image + red mask overlay + centroid crosshair -> RGBA PIL image.
 
     The red semi-transparent overlay shows which pixels the thresholding
@@ -159,11 +178,20 @@ def render_embryo(img, mask, centroid):
     gray = np.clip(img / vmax * 255, 0, 255).astype(np.uint8)
     base = Image.fromarray(gray, mode="L").convert("RGBA")
 
-    # Red semi-transparent overlay on masked pixels. Alpha=100 (out of 255)
-    # lets the underlying grayscale detail show through while clearly marking
-    # the mask boundary.
+    # Semi-transparent overlay on masked pixels. Alpha=100 (out of 255) lets
+    # the underlying grayscale detail show through while clearly marking the
+    # mask boundary.
     overlay_arr = np.zeros((*gray.shape, 4), dtype=np.uint8)
-    overlay_arr[mask] = [255, 50, 50, 100]
+    if class_map is None:
+        overlay_arr[mask] = [255, 50, 50, 100]
+    else:
+        # Multi-level Otsu: colour each checked class separately so the user
+        # can see which class contributed which region. This shows every
+        # selected pixel, whereas mask holds only the largest connected
+        # component, so the two deliberately differ when a selection is
+        # fragmented.
+        for i in selected_levels or []:
+            overlay_arr[class_map == i] = [*LEVEL_COLORS[i % len(LEVEL_COLORS)], 100]
     composite = Image.alpha_composite(base, Image.fromarray(overlay_arr, mode="RGBA"))
 
     # Cyan crosshair at the centroid. The arm length (s=25 pixels) and line
@@ -178,7 +206,7 @@ def render_embryo(img, mask, centroid):
     return composite
 
 
-# ── Application ───────────────────────────────────────────────────────────────
+# Applicatioj
 
 
 class ThresholdApp:
@@ -199,7 +227,7 @@ class ThresholdApp:
         self.root = root
         self.root.title("Find threshold for masking PSM")
 
-        # ── Data state ────────────────────────────────────────────────────
+        # ------------------------ Data state ------------------------------------------------------------------------------------------------------------─
         # These are populated by _load_file and remain None until a file is
         # loaded. All rendering code checks for None before proceeding.
         self.file_path = None
@@ -207,14 +235,23 @@ class ThresholdApp:
         self.channel_names = []
         self.is_nd2 = False
         self.T = self.P = self.C = self.Y = self.X = 0
+        self.custom_timepoint_params = {}
 
-        # ── Animation state ───────────────────────────────────────────────
+        # ------------------------ Multi-level Otsu cache ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        # The class map depends only on the image and the level count, not on
+        # which classes are checked, so it is kept between redraws. Toggling a
+        # checkbox would otherwise repeat a threshold search that takes about
+        # two seconds at five levels and would freeze the window each time.
+        self._class_map = None
+        self._class_map_key = None
+
+        # ------------------------ Animation state ------------------------------------------------------------
         self.playing = False
         # Stores the id returned by root.after() so the scheduled callback
         # can be cancelled when the user presses Pause.
         self.after_id = None
 
-        # ── Display scaling ───────────────────────────────────────────────
+        # ------------------------ Display scaling ------------------------------------------------------------
         # Each embryo image is scaled to this size in pixels for display.
         # The raw images are typically 1024×1024; displaying them at full
         # resolution would make the window too large on most screens.
@@ -228,7 +265,7 @@ class ThresholdApp:
 
         self._build_ui()
 
-    # ── UI construction ───────────────────────────────────────────────────
+    # -- UI construction --
 
     def _build_ui(self):
         # Left panel: all controls. Using a fixed-width frame keeps the
@@ -241,7 +278,7 @@ class ThresholdApp:
         ttk.Label(ctrl, text="Red overlay = mask  |  + = centroid",
                   foreground="gray").pack(anchor=tk.W, pady=(0, 10))
 
-        # ── File picker ───────────────────────────────────────────────────
+        # -- File picker--
         # Browse opens a native file dialog filtered to ND2 and TIF files.
         # The text entry allows pasting a path directly (useful when the
         # file is on a remote mount that the dialog cannot browse).
@@ -253,7 +290,7 @@ class ThresholdApp:
         ttk.Button(ctrl, text="Load", command=self._load_file).pack(
             fill=tk.X, pady=(0, 10))
 
-        # ── Channel selector ──────────────────────────────────────────────
+        #--------- Channel selector------------------------
         ttk.Label(ctrl, text="Channel").pack(anchor=tk.W)
         self.channel_var = tk.StringVar()
         self.channel_combo = ttk.Combobox(ctrl, textvariable=self.channel_var,
@@ -261,7 +298,7 @@ class ThresholdApp:
         self.channel_combo.pack(fill=tk.X, pady=(0, 10))
         self.channel_combo.bind("<<ComboboxSelected>>", lambda _: self._update())
 
-        # ── Embryo navigation ─────────────────────────────────────────────
+        # --------- Embryo navigation -------------------------------
         # Prev/Next buttons and a label showing the current position index.
         # This frame is hidden when a single-embryo TIF is loaded because
         # there is only one position to display.
@@ -276,14 +313,14 @@ class ThresholdApp:
         ttk.Button(self.nav_frame, text="Next", command=self._next_embryo).pack(
             side=tk.LEFT)
 
-        # ── T slider ─────────────────────────────────────────────────────
+        #--------------------- T slider-----------------------
         ttk.Label(ctrl, text="T").pack(anchor=tk.W)
         self.t_var = tk.IntVar(value=0)
         self.t_slider = tk.Scale(ctrl, from_=0, to=0, orient=tk.HORIZONTAL,
                                  variable=self.t_var, command=lambda _: self._update())
         self.t_slider.pack(fill=tk.X, pady=(0, 10))
 
-        # ── Sigma slider ──────────────────────────────────────────────────
+        # ---------------------------Sigma slider--------------------------------------------
         # Gaussian blur radius in pixels. Higher values smooth over noise
         # but reduce sensitivity to fine embryo boundary details. Typical
         # values for PSM imaging are 15–40.
@@ -293,17 +330,98 @@ class ThresholdApp:
                  variable=self.sigma_var,
                  command=lambda _: self._update()).pack(fill=tk.X, pady=(0, 10))
 
-        # ── Percentile slider ─────────────────────────────────────────────
+        # ---------------------------- Method selector--------------------------------------
+        ttk.Label(ctrl, text="Threshold Method").pack(anchor=tk.W)
+        self.method_var = tk.StringVar(value="Percentile")
+        self.method_combo = ttk.Combobox(ctrl, textvariable=self.method_var,
+                                         state="readonly", width=34)
+        self.method_combo["values"] = [
+            "Percentile",
+            "Multi-Level Otsu",
+            "Percentile -> Otsu ROI",
+            "Local Otsu (Block-Interpolated)", 
+            "Local Otsu (Pixel-by-Pixel)"
+        ]
+        self.method_combo.pack(fill=tk.X, pady=(0, 5))
+        self.method_combo.bind("<<ComboboxSelected>>", lambda _: self._on_method_change())
+
+        # ------------------------ Block Size selector ------------------------------------
+        self.block_label = ttk.Label(ctrl, text="Block Size (Local Otsu only)", state=tk.DISABLED)
+        self.block_label.pack(anchor=tk.W)
+        self.block_var = tk.IntVar(value=64)
+        self.block_combo = ttk.Combobox(ctrl, textvariable=self.block_var,
+                                         state=tk.DISABLED, width=20)
+        self.block_combo["values"] = [16, 32, 64, 128]
+        self.block_combo.pack(fill=tk.X, pady=(0, 10))
+        self.block_combo.bind("<<ComboboxSelected>>", lambda _: self._update())
+
+        # ------------------------ Multi-level Otsu levels ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------─
+        # Number of intensity classes the image is split into. Capped at
+        # MAX_OTSU_LEVELS because the threshold search cost grows steeply
+        # with each added level.
+        self.levels_frame = ttk.Frame(ctrl)
+        self.levels_label = ttk.Label(self.levels_frame, text="Levels")
+        self.levels_label.pack(side=tk.LEFT)
+        self.levels_var = tk.IntVar(value=3)
+        self.levels_spin = ttk.Spinbox(
+            self.levels_frame, from_=2, to=MAX_OTSU_LEVELS, width=5,
+            textvariable=self.levels_var, command=self._on_levels_change,
+        )
+        self.levels_spin.pack(side=tk.LEFT, padx=(6, 0))
+
+        # ------------------------ Level selection checkboxes ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        # One checkbox per class, rebuilt whenever the level count changes.
+        # Any combination can be selected; the mask is the union of the
+        # checked classes. Populated by _rebuild_level_checkboxes.
+        self.levels_check_frame = ttk.Frame(ctrl)
+        self.level_vars = []
+
+        # ------------------------ Percentile slider ------------------------------------
         # Pixels above this percentile of the smoothed image are included
         # in the binary mask. Lower values include more background; higher
         # values restrict the mask to only the brightest regions.
-        ttk.Label(ctrl, text="Percentile").pack(anchor=tk.W)
+        # Kept as an attribute so the multi-level Otsu controls can be packed
+        # directly above it; pack() alone would append them to the bottom of
+        # the panel.
+        self.pct_label = ttk.Label(ctrl, text="Percentile")
+        self.pct_label.pack(anchor=tk.W)
         self.pct_var = tk.DoubleVar(value=90.0)
-        tk.Scale(ctrl, from_=10.0, to=99.5, orient=tk.HORIZONTAL,
-                 resolution=0.5, variable=self.pct_var,
-                 command=lambda _: self._update()).pack(fill=tk.X, pady=(0, 10))
+        self.pct_slider = tk.Scale(ctrl, from_=10.0, to=99.5, orient=tk.HORIZONTAL,
+                                   resolution=0.5, variable=self.pct_var,
+                                   command=lambda _: self._update())
+        self.pct_slider.pack(fill=tk.X, pady=(0, 10))
+        
+        # ------------------------ Invert selector ------------------------------------------------------------
+        self.invert_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ctrl, text="Invert Mask", variable=self.invert_var,
+                        command=self._update).pack(anchor=tk.W, pady=(0, 10))
 
-        # ── Animation controls ────────────────────────────────────────────
+        # ------------------------ Per-timepoint parameter overrides ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------─
+        ttk.Separator(ctrl).pack(fill=tk.X, pady=5)
+        override_frame = ttk.Frame(ctrl)
+        override_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(override_frame, text="Apply to current T",
+                   command=self._apply_to_current_t).pack(fill=tk.X, pady=(0, 4))
+        range_frame = ttk.Frame(override_frame)
+        range_frame.pack(fill=tk.X)
+        self.range_start_var = tk.IntVar(value=0)
+        self.range_end_var = tk.IntVar(value=0)
+        ttk.Label(range_frame, text="Range").pack(side=tk.LEFT)
+        self.range_start_spin = ttk.Spinbox(
+            range_frame, from_=0, to=0, textvariable=self.range_start_var, width=5
+        )
+        self.range_start_spin.pack(side=tk.LEFT, padx=(6, 2))
+        self.range_end_spin = ttk.Spinbox(
+            range_frame, from_=0, to=0, textvariable=self.range_end_var, width=5
+        )
+        self.range_end_spin.pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Button(range_frame, text="Apply",
+                   command=self._apply_to_range).pack(side=tk.LEFT)
+        self.override_status_var = tk.StringVar(value="Customized: 0 / 0 T")
+        ttk.Label(override_frame, textvariable=self.override_status_var,
+                  foreground="gray").pack(anchor=tk.W, pady=(4, 0))
+
+        # ------------------------ Animation controls ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
         ttk.Separator(ctrl).pack(fill=tk.X, pady=5)
         anim_frame = ttk.Frame(ctrl)
         anim_frame.pack(fill=tk.X, pady=(0, 5))
@@ -315,18 +433,18 @@ class ThresholdApp:
         ttk.Spinbox(anim_frame, from_=0.1, to=5.0, increment=0.1,
                      textvariable=self.delay_var, width=5).pack(side=tk.LEFT)
 
-        # ── Save YAML ────────────────────────────────────────────────────
+        # ------------------------ Save YAML ------------------------------------------------------------------------------------------------------------─
         ttk.Separator(ctrl).pack(fill=tk.X, pady=5)
         ttk.Button(ctrl, text="Save thresholds to YAML",
                    command=self._save_yaml).pack(fill=tk.X, pady=(5, 0))
 
-        # ── Status label ──────────────────────────────────────────────────
+        # ------------------------ Status label ------------------------------------------------------------------------------------─
         # Displays load confirmation, save confirmation, and error messages.
         self.status_var = tk.StringVar()
         ttk.Label(ctrl, textvariable=self.status_var, foreground="green",
                   wraplength=250).pack(anchor=tk.W, pady=(5, 0))
 
-        # ── Right panel: image display ────────────────────────────────────
+        # ------------------------ Right panel: image display ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
         self.display_frame = ttk.Frame(self.root, padding=10)
         self.display_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -347,7 +465,7 @@ class ThresholdApp:
         ttk.Label(self.display_frame, textvariable=self.cap_var,
                   foreground="gray").pack(anchor=tk.W, pady=(0, 5))
 
-    # ── File loading ──────────────────────────────────────────────────────
+    # ------------------------ File loading ------------------------------------------------------------------------------------------------------------------------------------─
 
     def _browse(self):
         """Open a native file dialog filtered to ND2 and TIF files."""
@@ -382,6 +500,7 @@ class ThresholdApp:
         self.file_path = path
         self.max_proj, self.channel_names, self.is_nd2 = load_file(path)
         self.T, self.P, self.C, self.Y, self.X = self.max_proj.shape
+        self.custom_timepoint_params = {}
 
         # Reset embryo index to the first position.
         self.embryo_idx = 0
@@ -393,6 +512,10 @@ class ThresholdApp:
         # Set the T slider range to match the number of timepoints.
         self.t_slider.config(to=max(0, self.T - 1))
         self.t_var.set(0)
+        self.range_start_var.set(0)
+        self.range_end_var.set(0)
+        self.range_start_spin.config(to=max(0, self.T - 1))
+        self.range_end_spin.config(to=max(0, self.T - 1))
 
         # Show embryo navigation only for multi-position ND2 files.
         # Single-embryo TIFs have P=1 so navigation is meaningless.
@@ -405,9 +528,10 @@ class ThresholdApp:
         self.status_var.set(
             f"Loaded: T={self.T}, P={self.P}, C={self.C}, "
             f"Y={self.Y}, X={self.X}")
+        self._update_override_status()
         self._update()
 
-    # ── Embryo navigation ─────────────────────────────────────────────────
+    # ------------------------ Embryo navigation ------------------------------------------------------------------------------------
 
     def _prev_embryo(self):
         """Navigate to the previous embryo position, wrapping around."""
@@ -429,7 +553,140 @@ class ThresholdApp:
         """Update the navigation label to show the current position index."""
         self.embryo_label_var.set(f"Embryo {self.embryo_idx} / {self.P - 1}")
 
-    # ── Rendering ─────────────────────────────────────────────────────────
+    # ------------------------ Rendering ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+    def _on_method_change(self):
+        """Enable/disable controls based on method and trigger update."""
+        method = self.method_var.get()
+        if method == "Multi-Level Otsu":
+            self.pct_slider.config(state=tk.DISABLED)
+        else:
+            self.pct_slider.config(state=tk.NORMAL)
+
+        # The level spinbox and class checkboxes are packed and unpacked
+        # rather than greyed out because the checkbox count varies, so an
+        # inactive row of them would be misleading clutter.
+        if method == "Multi-Level Otsu":
+            self.levels_frame.pack(anchor=tk.W, pady=(0, 4), before=self.pct_label)
+            self.levels_check_frame.pack(anchor=tk.W, pady=(0, 10), before=self.pct_label)
+            if not self.level_vars:
+                self._rebuild_level_checkboxes()
+        else:
+            self.levels_frame.pack_forget()
+            self.levels_check_frame.pack_forget()
+
+
+        if "Local Otsu" in method:
+            self.block_label.config(state=tk.NORMAL)
+            self.block_combo.config(state="readonly")
+        else:
+            self.block_label.config(state=tk.DISABLED)
+            self.block_combo.config(state=tk.DISABLED)
+            
+        self._update()
+
+    def _rebuild_level_checkboxes(self):
+        """Recreate one checkbox per intensity class for the current level count.
+
+        The checkboxes are destroyed and rebuilt rather than hidden because
+        the number of classes changes with the Levels spinbox. Selection is
+        reset to the brightest class instead of being carried over: class
+        indices are relative to the level count, so class 2 of 3 covers a
+        different intensity band than class 2 of 4 and preserving the old
+        checks would silently change which pixels are selected.
+        """
+        for widget in self.levels_check_frame.winfo_children():
+            widget.destroy()
+        self.level_vars = []
+
+        levels = self.levels_var.get()
+        for i in range(levels):
+            # Default to the brightest class alone, which reproduces a plain
+            # global Otsu threshold and is the usual starting point.
+            var = tk.BooleanVar(value=(i == levels - 1))
+            self.level_vars.append(var)
+            ttk.Checkbutton(self.levels_check_frame, text=str(i), variable=var,
+                            command=self._update).pack(side=tk.LEFT)
+
+    def _on_levels_change(self):
+        """Rebuild the class checkboxes after the level count changes."""
+        self._rebuild_level_checkboxes()
+        self._update()
+
+    def _selected_levels(self):
+        """Return the indices of the currently checked intensity classes."""
+        return [i for i, var in enumerate(self.level_vars) if var.get()]
+
+    def _method_code(self):
+        """Return the internal method string for the current UI selection."""
+        method_map = {
+            "Percentile": "percentile",
+            "Multi-Level Otsu": "multiotsu",
+            "Percentile -> Otsu ROI": "percentile_otsu_roi",
+            "Local Otsu (Block-Interpolated)": "local_otsu_interp",
+            "Local Otsu (Pixel-by-Pixel)": "local_otsu_pixel",
+        }
+        return method_map.get(self.method_var.get(), "percentile")
+
+    def _current_params(self):
+        """Return threshold parameters represented by the current controls."""
+        ch_idx = self.channel_combo.current()
+        if ch_idx < 0:
+            ch_idx = 0
+        channel = self.channel_names[ch_idx] if self.channel_names else f"Ch{ch_idx}"
+        method = self._method_code()
+        params = {
+            "channel": channel,
+            "channel_index": ch_idx,
+            "sigma": self.sigma_var.get(),
+            "percentile": self.pct_var.get(),
+            "method": method,
+            "invert": self.invert_var.get(),
+        }
+        if "local_otsu" in method:
+            params["block_size"] = self.block_var.get()
+        if method == "multiotsu":
+            params["levels"] = self.levels_var.get()
+            params["selected_levels"] = self._selected_levels()
+        return params
+
+    def _apply_to_current_t(self):
+        """Store current controls for the currently selected timepoint."""
+        if self.max_proj is None:
+            return
+        t = int(self.t_var.get())
+        self.custom_timepoint_params[t] = dict(self._current_params())
+        self._update_override_status()
+
+    def _apply_to_range(self):
+        """Store current controls for every timepoint in an inclusive range."""
+        if self.max_proj is None:
+            return
+        start = int(self.range_start_var.get())
+        end = int(self.range_end_var.get())
+        if start > end:
+            start, end = end, start
+        start = max(0, min(start, self.T - 1))
+        end = max(0, min(end, self.T - 1))
+        params = dict(self._current_params())
+        for t in range(start, end + 1):
+            self.custom_timepoint_params[t] = dict(params)
+        self.range_start_var.set(start)
+        self.range_end_var.set(end)
+        self._update_override_status()
+
+    def _update_override_status(self):
+        total = self.T if self.max_proj is not None else 0
+        customized = len(self.custom_timepoint_params)
+        self.override_status_var.set(f"Customized: {customized} / {total} T")
+
+    def _materialize_timepoint_params(self, default_params):
+        """Build the full indexed parameter list written to YAML."""
+        params_by_t = [dict(default_params) for _ in range(self.T)]
+        for t, params in self.custom_timepoint_params.items():
+            if 0 <= t < self.T:
+                params_by_t[t] = dict(params)
+        return params_by_t
 
     def _update(self):
         """Recompute the mask and redraw the embryo image.
@@ -451,10 +708,25 @@ class ThresholdApp:
         sigma = self.sigma_var.get()
         percentile = self.pct_var.get()
         channel = self.channel_names[ch_idx]
+        
+        method = self._method_code()
+        block_size = self.block_var.get()
+        invert = self.invert_var.get()
+        levels = self.levels_var.get()
+        selected_levels = self._selected_levels()
 
-        self.header_var.set(
+        h_str = (
             f"T = {t}  |  {channel}  |  sigma = {sigma}  |  "
-            f"percentile = {percentile}")
+            f"method = {method}  |  percentile = {percentile}"
+        )
+        if "local_otsu" in method:
+            h_str += f"  |  block = {block_size}"
+        if method == "multiotsu":
+            shown = ",".join(str(i) for i in selected_levels) or "none"
+            h_str += f"  |  levels = {levels}  |  selected = {shown}"
+        if invert:
+            h_str += "  |  INVERTED"
+        self.header_var.set(h_str)
 
         # Extract the 2-D image for the current (t, p, ch) combination.
         img = self.max_proj[t, p, ch_idx]
@@ -467,10 +739,23 @@ class ThresholdApp:
         # threshold. This is the same function used by centroid_align_xy.py
         # so that the mask the user sees here is exactly what the alignment
         # script will detect.
-        mask, centroid = find_largest_mask_xy(smoothed, percentile)
+        #
+        # The class map is reused for both the mask and the per-class overlay,
+        # and is only recomputed when the image or the level count changes.
+        class_map = None
+        if method == "multiotsu":
+            key = (t, p, ch_idx, sigma, levels)
+            if key != self._class_map_key:
+                self._class_map = multiotsu_class_map(smoothed, levels)
+                self._class_map_key = key
+            class_map = self._class_map
+
+        mask, centroid = find_largest_mask_xy(smoothed, percentile, method=method, block_size=block_size, invert=invert,
+                                              levels=levels, selected_levels=selected_levels, class_map=class_map)
 
         # Render the composite image and scale it for display.
-        pil_img = render_embryo(img, mask, centroid)
+        pil_img = render_embryo(img, mask, centroid,
+                                class_map=class_map, selected_levels=selected_levels)
         pil_img = pil_img.resize(
             (self.display_size, self.display_size), Image.LANCZOS)
         photo = ImageTk.PhotoImage(pil_img)
@@ -486,12 +771,23 @@ class ThresholdApp:
         area = int(mask.sum())
         cx, cy = centroid[1], centroid[0]
         mean_val = float(img[mask].mean()) if mask.any() else 0.0
-        self.cap_var.set(
+        cap = (
             f"Embryo {p}  |  Area: {area} px ({area / mask.size * 100:.1f}%)  |  "
             f"Centroid: ({cx:.1f}, {cy:.1f})  |  "
             f"Mean intensity: {mean_val:.1f}")
 
-    # ── Animation ─────────────────────────────────────────────────────────
+        # Report how much of the coloured overlay survives into the mask. The
+        # mask keeps only the largest connected component, so a selection whose
+        # classes do not touch loses everything outside the biggest piece.
+        # Anything below 100% means the crosshair may sit on a different
+        # structure than the overlay suggests.
+        if class_map is not None and selected_levels:
+            selected_px = int(np.isin(class_map, selected_levels).sum())
+            if selected_px:
+                cap += f"  |  Largest component: {area / selected_px * 100:.0f}% of selected"
+        self.cap_var.set(cap)
+
+    # ------------------------ Animation ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
     def _toggle_play(self):
         """Toggle between playing and paused states."""
@@ -520,7 +816,7 @@ class ThresholdApp:
         delay_ms = int(self.delay_var.get() * 1000)
         self.after_id = self.root.after(delay_ms, self._animate)
 
-    # ── Save YAML ─────────────────────────────────────────────────────────
+    # ------------------------ Save YAML ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
     def _save_yaml(self):
         """Save the current embryo's threshold parameters to a YAML file.
@@ -541,23 +837,29 @@ class ThresholdApp:
 
         p = self.embryo_idx
         ch_idx = self.channel_combo.current()
-        channel = self.channel_names[ch_idx]
-        sigma = self.sigma_var.get()
-        percentile = self.pct_var.get()
+        if ch_idx < 0:
+            ch_idx = 0
+        params = self._current_params()
+        channel = params["channel"]
+        sigma = params["sigma"]
+        percentile = params["percentile"]
+        method = params["method"]
+        block_size = params.get("block_size", self.block_var.get())
 
         t = self.t_var.get()
+        invert = params.get("invert", False)
+        
         img = self.max_proj[t, p, ch_idx]
         smoothed = gaussian_filter(img, sigma=sigma)
-        mask, centroid = find_largest_mask_xy(smoothed, percentile)
+        mask, centroid = find_largest_mask_xy(
+            smoothed, percentile, method=method, block_size=block_size, invert=invert,
+            levels=params.get("levels", self.levels_var.get()),
+            selected_levels=params.get("selected_levels"))
         area = int(mask.sum())
-
+        
         output = {
-            "parameters": {
-                "channel": channel,
-                "channel_index": ch_idx,
-                "sigma": sigma,
-                "percentile": percentile,
-            },
+            "parameters": params,
+            "timepoint_parameters": self._materialize_timepoint_params(params),
             "source": {
                 "file": str(Path(self.file_path)),
                 "image_shape": {
@@ -596,10 +898,10 @@ class ThresholdApp:
 
         self.status_var.set(f"Saved \u2192 {fname}")
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     root = tk.Tk()
     ThresholdApp(root)
     root.mainloop()
+
+find_threshold.py
+Displaying find_threshold.py.
